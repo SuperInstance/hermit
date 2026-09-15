@@ -67,6 +67,116 @@ const validPayload = {
 		}
 	]
 }
+const evidencePayload = () => {
+	const search = {
+		matchedSearches7d: 4,
+		previous7d: 2,
+		searches30d: 8,
+		queries: [
+			{
+				query: "memory",
+				scope: "catalog",
+				searches7d: 4,
+				previous7d: 2,
+				searches30d: 8
+			}
+		],
+		omittedQueries: 0,
+		periodStart: validPayload.weekStart,
+		periodEnd: validPayload.weekEnd,
+		dataThrough: validPayload.weekEnd,
+		collectionStartedAt: validPayload.coverage.collectionStartedAt
+	}
+	const adoption = {
+		source: "package-trending",
+		rank: 2,
+		snapshotId: "package-week-1",
+		rankingVersion: "package-trending",
+		periodStart: validPayload.weekStart,
+		periodEnd: validPayload.weekEnd,
+		generatedAt: validPayload.weekEnd,
+		sourceObservedAt: null,
+		downloads: 341,
+		installs: 1,
+		bookmarks: null,
+		lifetimeInstalls: null
+	}
+	const recommendation = {
+		artifactKind: "plugin",
+		id: "plugin:memory-kit",
+		displayName: "Memory Kit",
+		url: "https://clawhub.ai/plugins/memory-kit",
+		category: "memory",
+		support: "both",
+		search,
+		adoption,
+		metadataCheckedAt: validPayload.weekEnd
+	}
+	const catalog = {
+		totalSearches: validPayload.totalSearches,
+		sourceCounts: validPayload.sourceCounts,
+		coverage: validPayload.coverage,
+		classificationStatus: "available",
+		currentMetadataStatus: "available",
+		adoption: {
+			status: "available",
+			generatedAt: validPayload.weekEnd,
+			periodStart: validPayload.weekStart,
+			periodEnd: validPayload.weekEnd,
+			snapshotId: "synthetic",
+			rankingVersion: "v1",
+			totalItems: 1,
+			inspectedItems: 1,
+			truncated: false
+		},
+		companyOpportunities: validPayload.companyOpportunities.map((row) => ({
+			...row,
+			scope: "catalog"
+		})),
+		officialGaps: validPayload.officialGaps.map((row) => ({
+			...row,
+			scope: "catalog"
+		})),
+		movers: validPayload.movers.map((row) => ({ ...row, scope: "catalog" })),
+		recommendations: [recommendation]
+	}
+	return {
+		kind: "search_intelligence_weekly_v2",
+		weekStart: validPayload.weekStart,
+		weekEnd: validPayload.weekEnd,
+		minimumSearches: 3,
+		dashboardUrl: validPayload.dashboardUrl,
+		truncated: false,
+		catalogs: {
+			plugins: catalog,
+			skills: {
+				...catalog,
+				totalSearches: 0,
+				sourceCounts: { clawhubWeb: 0, openclawControlUi: 0 },
+				classificationStatus: "unavailable",
+				companyOpportunities: [],
+				officialGaps: [],
+				movers: [],
+				recommendations: [
+					{
+						...recommendation,
+						artifactKind: "skill",
+						id: "clawhub:homeassistant",
+						displayName: "Homeassistant Skill",
+						url: "https://clawhub.ai/example/skills/homeassistant",
+						support: "adoption-only",
+						search: null,
+						adoption: {
+							...adoption,
+							source: "clawhub-trending",
+							periodStart: validPayload.weekEnd - 86_400_000
+						}
+					}
+				]
+			}
+		}
+	}
+}
 let mockClock: ReturnType<typeof spyOn<typeof Date, "now">> | undefined
 const owners: SqliteD1Database[] = []
 const setup = () => {
@@ -128,6 +238,223 @@ afterEach(() => {
 })
 
 describe("ClawHub weekly search intelligence receiver", () => {
+	it("renders separate catalog evidence, including adoption-supported skills with no searches", async () => {
+		const { client, posts } = setup()
+		expect(
+			(
+				await handleSearchIntelligenceApiRequest(
+					request(evidencePayload()),
+					client
+				)
+			)?.status
+		).toBe(200)
+		const text = (posts[0].body.components as unknown[])
+			.flatMap(texts)
+			.join("\n")
+		expect(text).toContain("Plugins")
+		expect(text).toContain("Skills")
+		expect(text).toContain("Memory Kit")
+		expect(text).toContain("Homeassistant Skill")
+		expect(text).toContain("341 downloads")
+		expect(text).toContain("adoption-only")
+		expect(text).toContain("2026-09-06")
+		expect(text).toContain("quality review")
+		expect(posts[0].body.allowed_mentions).toEqual({ parse: [] })
+	})
+	it("keeps independently hydrated adoption evidence when search metadata is unavailable", async () => {
+		const { client, posts } = setup()
+		const payload = evidencePayload()
+		payload.catalogs.skills.currentMetadataStatus = "unavailable"
+		payload.catalogs.skills.recommendations[0].adoption = {
+			...payload.catalogs.skills.recommendations[0].adoption,
+			source: "skills-sh-trending",
+			periodStart: null,
+			periodEnd: null,
+			sourceObservedAt: payload.weekEnd - 86_400_000,
+			downloads: null,
+			installs: null,
+			lifetimeInstalls: 1200
+		} as never
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		const rendered = JSON.stringify(posts[0].body)
+		expect(rendered).toContain("1200 lifetime installs")
+		expect(rendered).toContain("source observed 2026-09-06T00:00Z")
+		expect(rendered).toContain("search metadata unavailable")
+	})
+	it("reports an explicit empty outcome for every catalog section", async () => {
+		const { client, posts } = setup()
+		const payload = evidencePayload()
+		for (const catalog of Object.values(payload.catalogs)) {
+			catalog.recommendations = []
+			catalog.companyOpportunities = []
+			catalog.officialGaps = []
+			catalog.movers = []
+		}
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		const rendered = JSON.stringify(posts[0].body)
+		for (const section of [
+			"recommendations",
+			"company opportunities",
+			"official gaps",
+			"movers"
+		])
+			expect(rendered.split(`No qualifying ${section}.`)).toHaveLength(3)
+	})
+	it("preserves a frozen legacy week and rejects replacing its receipt with a v2 report", async () => {
+		const { client, posts } = setup()
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(), client))?.status
+		).toBe(200)
+		expect(
+			(
+				await handleSearchIntelligenceApiRequest(
+					request(evidencePayload()),
+					client
+				)
+			)?.status
+		).toBe(409)
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(), client))?.status
+		).toBe(200)
+		expect(posts).toHaveLength(1)
+	})
+	it("rejects private fields, low-volume query text and inconsistent catalog evidence before receipt access", async () => {
+		const { client, posts, owner } = setup()
+		const change = (
+			mutate: (payload: ReturnType<typeof evidencePayload>) => void
+		) => {
+			const payload = evidencePayload()
+			mutate(payload)
+			return payload
+		}
+		const invalid = [
+			{ ...evidencePayload(), userId: "private" },
+			change((payload) => {
+				Object.assign(payload.catalogs.skills, { identity: "private" })
+			}),
+			change((payload) => {
+				payload.catalogs.plugins.recommendations[0].artifactKind = "skill"
+			}),
+			change((payload) => {
+				payload.catalogs.plugins.recommendations[0].url =
+					"https://evil.example/plugin"
+			}),
+			change((payload) => {
+				payload.catalogs.plugins.recommendations[0].search.queries[0].searches7d = 2
+			}),
+			change((payload) => {
+				payload.catalogs.plugins.recommendations[0].search.queries.push(
+					payload.catalogs.plugins.recommendations[0].search.queries[0]
+				)
+			}),
+			change((payload) => {
+				payload.catalogs.plugins.recommendations[0].search.periodEnd++
+			}),
+			change((payload) => {
+				payload.catalogs.plugins.recommendations[0].search.matchedSearches7d = 13
+			}),
+			change((payload) => {
+				Object.assign(payload.catalogs.skills.recommendations[0].adoption, {
+					source: ["clawhub-trending"]
+				})
+			}),
+			change((payload) => {
+				payload.catalogs.skills.recommendations[0].adoption.periodStart =
+					payload.weekEnd
+			}),
+			change((payload) => {
+				payload.catalogs.skills.recommendations[0].adoption.installs = -1
+			}),
+			change((payload) => {
+				payload.catalogs.skills.recommendations[0].support = "search-only"
+			}),
+			change((payload) => {
+				payload.catalogs.skills.adoption.status = "unavailable"
+			}),
+			change((payload) => {
+				payload.catalogs.plugins.companyOpportunities[0].scope = "shelf"
+			}),
+			change((payload) => {
+				payload.catalogs.skills.recommendations = Array(6).fill(
+					payload.catalogs.skills.recommendations[0]
+				)
+			})
+		]
+		for (const payload of invalid)
+			expect(
+				(await handleSearchIntelligenceApiRequest(request(payload), client))
+					?.status
+			).toBe(400)
+		expect(posts).toHaveLength(0)
+		expect(
+			owner.database.query("SELECT count(*) AS count FROM keyValue").get()
+		).toEqual({ count: 0 })
+	})
+	it("reconciles v2 response loss and preserves the receipt on replay", async () => {
+		const { client, posts } = setup()
+		const original = client.rest.post.bind(client.rest)
+		client.rest.post = (async (...args: Parameters<typeof original>) => {
+			await original(...args)
+			throw new Error("Response lost")
+		}) as typeof client.rest.post
+		const payload = evidencePayload()
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(503)
+		client.rest.get = async () => [
+			{
+				id: "message-1",
+				author: { id: "bot-user", bot: true },
+				timestamp: new Date().toISOString(),
+				components: posts[0].body.components
+			}
+		]
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		expect(posts).toHaveLength(1)
+	})
+	it("bounds v2 text with both catalogs and explicit omissions while leaving source facts intact", async () => {
+		const { client, posts } = setup()
+		const payload = evidencePayload()
+		for (const catalog of [payload.catalogs.plugins, payload.catalogs.skills]) {
+			const candidate = catalog.recommendations[0]
+			catalog.recommendations = Array.from({ length: 5 }, (_, index) => ({
+				...candidate,
+				id: candidate.id + index,
+				displayName: "@everyone [link](https://evil.example) ".repeat(3).trim(),
+				url: candidate.url + "?proof=" + "x".repeat(800)
+			})) as typeof catalog.recommendations
+		}
+		payload.truncated = true
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		const text = (posts[0].body.components as unknown[])
+			.flatMap(texts)
+			.join("\n")
+		expect(text.length).toBeLessThanOrEqual(4000)
+		expect(text).toContain("Plugins Featured recommendations")
+		expect(text).toContain("Skills Featured recommendations")
+		expect(text).toContain("More evidence on the dashboard")
+		expect(text).toContain("Input capped")
+		expect(text).not.toContain("@everyone")
+		expect(text).not.toContain("[link](https://evil.example)")
+		expect(payload.catalogs.plugins.recommendations).toHaveLength(5)
+	})
 	it("delivers bounded aggregate facts with Carbon V2 and no mentions", async () => {
 		const { client, posts } = setup()
 		const response = await handleSearchIntelligenceApiRequest(request(), client)

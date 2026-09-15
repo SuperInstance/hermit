@@ -6,7 +6,8 @@ Companion to [CLAW-768](https://linear.app/my-openclaw/issue/CLAW-768) under
 ## Boundary and ownership
 
 `POST /api/clawhub-search-intelligence/weekly` accepts ClawHub's frozen
-`plugin_search_weekly` digest. It uses the existing `CLAWHUB_HERMIT_TOKEN`
+`search_intelligence_weekly_v2` digest and previously frozen `plugin_search_weekly`
+digests. It uses the existing `CLAWHUB_HERMIT_TOKEN`
 (fallback `CLAWHUB_BAN_APPEALS_TOKEN`) and `CLAWHUB_SITE_URL` trusted-origin
 configuration. Destination is `formSettings.clawhubAppealReviewChannelId`, the
 `maintainer-clawhub` channel. No role or user is mentioned.
@@ -38,6 +39,34 @@ stays below 4000 text characters; whole rows that do not fit are replaced by a
 dashboard pointer, never cut links or Markdown. Text is escaped, mentions are
 neutralized, and `allowed_mentions.parse` is empty. A localhost trusted dashboard
 origin produces a visible **LOCAL PREVIEW** heading.
+
+## Plugin and skill evidence
+
+[CLAW-893](https://linear.app/my-openclaw/issue/CLAW-893) adds named `plugins` and
+`skills` catalogs. Each carries its own company opportunities, official gaps,
+movers and up to five Featured recommendations, plus search coverage and adoption
+snapshot freshness. The complete v2 JSON payload is capped at 30,000 UTF-8 bytes.
+
+ClawHub's shared recommendation owner supplies candidate order and eligibility.
+Hermit displays separate search/adoption support, counts, periods and freshness;
+it never computes a combined score or changes Featured. Search-only recommendations
+need at least three matched searches in the completed week. Adoption-supported
+recommendations may show lower aggregate demand, but each displayed query detail
+still needs three searches. Details are capped at three queries per candidate,
+with an explicit omission count. Missing search evidence stays `null`.
+
+Current adoption snapshots may describe a different period from the completed
+search week. External observations carry their own `sourceObservedAt`; unknown
+source periods and unavailable metrics stay null. Lifetime counts are labeled as
+lifetime counts. Search metadata failure does not erase independently hydrated
+adoption evidence. Human quality, security and category-coverage review remains
+required before featuring anything.
+
+Legacy payload validation and rendering are retained for frozen retries. Both
+versions use the same origin/week receipt identity: v2 cannot replace an already
+claimed legacy week or cause a second message for it. Deploy receiver support
+before enabling the v2 sender. A read-only report/dry run does not call this POST
+endpoint; invoking it requests delivery.
 
 ## Delivery state and failure semantics
 
@@ -89,10 +118,11 @@ bun run test
 bun run deploy:dry-run
 ```
 
-Local validation: 13 focused receiver tests (105 assertions), typecheck, and
-deployment dry-run pass. After installing the existing artwork suite's
-ImageMagick prerequisite, the full Hermit suite passes: 300 tests across 35
-files, 184,958 assertions (114.70 seconds). No artwork source changes were needed.
+Receiver tests also cover both catalogs, rare query suppression, independent
+adoption hydration, frozen legacy replay, cross-version receipt collisions and
+v2 response-loss recovery. Local upgrade proof can use persistent Wrangler D1
+and a mock Discord transport; that demonstrates receipt continuity, not actual
+Discord delivery. The full artwork suite requires ImageMagick.
 
 Executable real-service proof (never deploys or registers commands):
 
