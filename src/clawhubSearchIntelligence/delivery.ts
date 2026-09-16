@@ -1,4 +1,9 @@
-import { Routes, type Client, type serializePayload } from "@buape/carbon"
+import {
+	Routes,
+	TextDisplay,
+	serializePayload,
+	type Client
+} from "@buape/carbon"
 import { formSettings } from "../../forms.config.js"
 import { getRuntimeEnv } from "../runtime/env.js"
 
@@ -37,9 +42,20 @@ const response = (value: unknown, status = 200) =>
 
 const componentText = (value: unknown): string[] => {
 	if (!value || typeof value !== "object") return []
-	const row = value as { content?: unknown; components?: unknown }
+	const row = value as {
+		content?: unknown
+		components?: unknown
+		type?: unknown
+		url?: unknown
+		label?: unknown
+	}
 	return [
 		...(typeof row.content === "string" ? [row.content] : []),
+		// Full lineups carry candidate identities in link buttons. Reconciliation
+		// must match those destinations as well as the human-readable text.
+		...(row.type === 2 && typeof row.url === "string"
+			? [canonical({ url: row.url, label: row.label })]
+			: []),
 		...(Array.isArray(row.components)
 			? row.components.flatMap(componentText)
 			: [])
@@ -93,12 +109,30 @@ const findDeliveredMessage = async (
 
 export const deliverWeeklyDigest = async (
 	client: Client,
-	digest: { weekStart: number; weekEnd: number; dashboardUrl: string },
+	digest: {
+		kind?: string
+		weekStart: number
+		weekEnd: number
+		dashboardUrl: string
+	},
 	body: ReturnType<typeof serializePayload>
 ): Promise<Response> => {
 	const db = getRuntimeEnv().DB.withSession("first-primary")
 	const key = `clawhub-search-weekly:${new URL(digest.dashboardUrl).origin}:${digest.weekStart}`
 	const payloadHash = await hash(canonical(digest))
+	if (digest.kind === "search_intelligence_weekly_v3") {
+		// Long candidate URLs may share a dashboard button. The full payload's
+		// fingerprint preserves exact report identity during uncertain-send recovery.
+		body = {
+			...body,
+			components: [
+				...(body.components ?? []),
+				...(serializePayload({
+					components: [new TextDisplay(`-# Report ${payloadHash}`)]
+				}).components ?? [])
+			]
+		}
+	}
 	const claim: Delivery = {
 		version: 1,
 		hash: payloadHash,

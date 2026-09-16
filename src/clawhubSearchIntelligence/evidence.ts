@@ -1,4 +1,10 @@
-import { Container, TextDisplay, serializePayload } from "@buape/carbon"
+import {
+	Container,
+	LinkButton,
+	Row as ComponentRow,
+	TextDisplay,
+	serializePayload
+} from "@buape/carbon"
 import {
 	count,
 	fields,
@@ -57,6 +63,22 @@ type Recommendation = {
 		lifetimeInstalls: number | null
 	}
 }
+type LineupRecommendation = Omit<Recommendation, "support"> & {
+	version: string | null
+	support: Recommendation["support"] | "current-only"
+}
+type FeaturedLineup = {
+	targetSize: 8
+	baseline: { id: string; version: string | null; featuredAt: number }[]
+	changes: { id: string; change: "retain" | "add"; emerging: boolean }[]
+	removals: {
+		id: string
+		displayName: string
+		url: string
+		reasons: string[]
+	}[]
+	shortfall: number
+}
 type Catalog = Pick<
 	Digest,
 	| "totalSearches"
@@ -92,6 +114,14 @@ export type EvidenceDigest = {
 	dashboardUrl: string
 	truncated: boolean
 	catalogs: { plugins: Catalog; skills: Catalog }
+}
+type LineupCatalog = Omit<Catalog, "recommendations"> & {
+	recommendations: LineupRecommendation[]
+	lineup: FeaturedLineup
+}
+type LineupDigest = Omit<EvidenceDigest, "kind" | "catalogs"> & {
+	kind: "search_intelligence_weekly_v3"
+	catalogs: { plugins: LineupCatalog; skills: LineupCatalog }
 }
 const scope = (value: unknown) =>
 	value === "catalog" || value === "shelf" || value === "legacy"
@@ -130,7 +160,8 @@ const validRecommendation = (
 	origins: string[],
 	weekStart: number,
 	weekEnd: number,
-	totalSearches: number
+	totalSearches: number,
+	fullLineup = false
 ) => {
 	if (
 		!fields(value, [
@@ -142,14 +173,16 @@ const validRecommendation = (
 			"support",
 			"metadataCheckedAt",
 			"search",
-			"adoption"
+			"adoption",
+			...(fullLineup ? ["version"] : [])
 		]) ||
 		value.artifactKind !== kind ||
 		!string(value.id, 256) ||
 		!string(value.displayName, 120) ||
 		!validUrl(value.url, origins) ||
 		!nullable(value.category, (item) => string(item, 120)) ||
-		!timestamp(value.metadataCheckedAt)
+		!timestamp(value.metadataCheckedAt) ||
+		(fullLineup && !nullable(value.version, (item) => string(item, 256)))
 	)
 		return false
 	const search = value.search
@@ -254,7 +287,7 @@ const validRecommendation = (
 	if (value.support === "search-only")
 		return (
 			record(search) &&
-			(search.matchedSearches7d as number) >= 3 &&
+			(search.matchedSearches7d as number) >= (fullLineup ? 1 : 3) &&
 			adoption === null
 		)
 	if (value.support === "both")
@@ -263,13 +296,87 @@ const validRecommendation = (
 			(search.matchedSearches7d as number) > 0 &&
 			adoption !== null
 		)
+	if (fullLineup && value.support === "current-only")
+		return search === null && adoption === null
 	return value.support === "adoption-only" && adoption !== null
+}
+
+const validLineup = (
+	value: unknown,
+	recommendations: LineupRecommendation[],
+	origins: string[]
+) => {
+	if (
+		!fields(value, [
+			"targetSize",
+			"baseline",
+			"changes",
+			"removals",
+			"shortfall"
+		]) ||
+		value.targetSize !== 8 ||
+		value.shortfall !== 8 - recommendations.length ||
+		!Array.isArray(value.baseline) ||
+		value.baseline.length > 100 ||
+		!value.baseline.every(
+			(entry) =>
+				fields(entry, ["id", "version", "featuredAt"]) &&
+				string(entry.id, 256) &&
+				nullable(entry.version, (item) => string(item, 256)) &&
+				timestamp(entry.featuredAt)
+		) ||
+		!Array.isArray(value.changes) ||
+		value.changes.length !== recommendations.length ||
+		!value.changes.every(
+			(entry) =>
+				fields(entry, ["id", "change", "emerging"]) &&
+				string(entry.id, 256) &&
+				(entry.change === "retain" || entry.change === "add") &&
+				typeof entry.emerging === "boolean"
+		) ||
+		!Array.isArray(value.removals) ||
+		value.removals.length > 100 ||
+		!value.removals.every(
+			(entry) =>
+				fields(entry, ["id", "displayName", "url", "reasons"]) &&
+				string(entry.id, 256) &&
+				string(entry.displayName, 120) &&
+				validUrl(entry.url, origins) &&
+				Array.isArray(entry.reasons) &&
+				entry.reasons.length > 0 &&
+				entry.reasons.length <= 12 &&
+				entry.reasons.every((reason) => string(reason, 256))
+		)
+	)
+		return false
+	const lineup = value as unknown as FeaturedLineup
+	const baseline = new Set(lineup.baseline.map((entry) => entry.id))
+	const selected = new Set(recommendations.map((entry) => entry.id))
+	const removed = new Set(lineup.removals.map((entry) => entry.id))
+	return (
+		baseline.size === lineup.baseline.length &&
+		removed.size === lineup.removals.length &&
+		lineup.changes.every(
+			(entry, index) =>
+				entry.id === recommendations[index].id &&
+				entry.change === (baseline.has(entry.id) ? "retain" : "add")
+		) &&
+		lineup.removals.every(
+			(entry) => baseline.has(entry.id) && !selected.has(entry.id)
+		) &&
+		lineup.baseline.every(
+			(entry) => selected.has(entry.id) || removed.has(entry.id)
+		) &&
+		recommendations.every(
+			(entry) => entry.support !== "current-only" || baseline.has(entry.id)
+		)
+	)
 }
 
 export const parseEvidenceDigest = (
 	value: unknown,
 	origins: string[]
-): EvidenceDigest | null => {
+): EvidenceDigest | LineupDigest | null => {
 	if (
 		!fields(value, [
 			"kind",
@@ -280,11 +387,13 @@ export const parseEvidenceDigest = (
 			"truncated",
 			"catalogs"
 		]) ||
-		value.kind !== "search_intelligence_weekly_v2" ||
+		(value.kind !== "search_intelligence_weekly_v2" &&
+			value.kind !== "search_intelligence_weekly_v3") ||
 		!fields(value.catalogs, ["plugins", "skills"]) ||
 		new TextEncoder().encode(JSON.stringify(value)).byteLength > 30_000
 	)
 		return null
+	const fullLineup = value.kind === "search_intelligence_weekly_v3"
 	for (const [name, kind] of [
 		["plugins", "plugin"],
 		["skills", "skill"]
@@ -301,7 +410,8 @@ export const parseEvidenceDigest = (
 				"companyOpportunities",
 				"officialGaps",
 				"movers",
-				"recommendations"
+				"recommendations",
+				...(fullLineup ? ["lineup"] : [])
 			]) ||
 			!validAdoptionSummary(catalog.adoption)
 		)
@@ -349,7 +459,7 @@ export const parseEvidenceDigest = (
 		if (
 			!summary ||
 			!Array.isArray(catalog.recommendations) ||
-			catalog.recommendations.length > 5 ||
+			catalog.recommendations.length > (fullLineup ? 8 : 5) ||
 			!catalog.recommendations.every((candidate) =>
 				validRecommendation(
 					candidate,
@@ -357,7 +467,8 @@ export const parseEvidenceDigest = (
 					origins,
 					summary.weekStart,
 					summary.weekEnd,
-					summary.totalSearches
+					summary.totalSearches,
+					fullLineup
 				)
 			) ||
 			new Set(catalog.recommendations.map((candidate) => candidate.id)).size !==
@@ -368,8 +479,17 @@ export const parseEvidenceDigest = (
 				))
 		)
 			return null
+		if (
+			fullLineup &&
+			!validLineup(
+				catalog.lineup,
+				catalog.recommendations as LineupRecommendation[],
+				origins
+			)
+		)
+			return null
 	}
-	return value as unknown as EvidenceDigest
+	return value as unknown as EvidenceDigest | LineupDigest
 }
 
 const safe = (value: string) =>
@@ -419,7 +539,153 @@ const recommendationText = (row: Recommendation) => {
 	].join("\n")
 }
 
-export const renderEvidenceDigest = (digest: EvidenceDigest) => {
+class CandidateLink extends LinkButton {
+	constructor(
+		public label: string,
+		public url: string
+	) {
+		super()
+	}
+}
+
+const compactName = (value: string) =>
+	safe(value.length > 24 ? `${value.slice(0, 23)}…` : value)
+const compactCount = (value: number | null | undefined) =>
+	value == null ? "?" : String(value)
+
+const renderLineupDigest = (digest: LineupDigest) => {
+	const preview = ["localhost", "127.0.0.1", "[::1]"].includes(
+		new URL(digest.dashboardUrl).hostname
+	)
+	// Discord link buttons cap URLs at 512 characters. Keep oversized links
+	// accessible through the canonical report instead of sending a rejected message.
+	const dashboardUrl =
+		digest.dashboardUrl.length <= 512
+			? digest.dashboardUrl
+			: new URL(
+					`/management?view=search-insights&endDay=${digest.weekEnd}`,
+					digest.dashboardUrl
+				).href
+	const components: (Container | TextDisplay)[] = [
+		new Container([
+			new TextDisplay(
+				`### ${preview ? "LOCAL PREVIEW · " : ""}ClawHub Featured lineups\n${time(digest.weekStart)} – ${time(digest.weekEnd)} UTC. Advisory; approval required.`
+			),
+			new ComponentRow([
+				new CandidateLink("Review full evidence and changes", dashboardUrl)
+			])
+		])
+	]
+	const supplements: { title: string; rows: string[]; omitted: boolean }[] = []
+	for (const [name, catalog] of [
+		["Plugins", digest.catalogs.plugins],
+		["Skills", digest.catalogs.skills]
+	] as const) {
+		const { lineup, recommendations, coverage, adoption } = catalog
+		const incomplete =
+			coverage.dataThrough === null ||
+			coverage.dataThrough < digest.weekEnd ||
+			coverage.collectionStartedAt === null ||
+			coverage.collectionStartedAt > digest.weekStart ||
+			coverage.gapStart !== null
+		const entries = recommendations.map((candidate, index) => {
+			const change = lineup.changes[index]
+			return `${index + 1}. **${compactName(candidate.displayName)}** · ${change.change === "retain" ? "Keep" : "Add"}${change.emerging ? " · Emerging" : ""}\n${candidate.support === "current-only" ? "Current selection; window evidence unavailable." : `${compactCount(candidate.search?.matchedSearches7d)} searches · ${candidate.adoption ? adoptionMetrics(candidate.adoption) : "Adoption counts unavailable"}`}`
+		})
+		const rows: (TextDisplay | ComponentRow<CandidateLink>)[] = [
+			new TextDisplay(
+				[
+					`**${name}: ${recommendations.length}/8** · ${lineup.removals.length} proposed removals${lineup.shortfall ? ` · ${lineup.shortfall} unfilled` : ""}`,
+					`Searches ${catalog.totalSearches}; through ${time(coverage.dataThrough)}.${incomplete ? " Incomplete history." : ""}`,
+					`Adoption ${time(adoption.periodStart)} – ${time(adoption.periodEnd)}; snapshot ${time(adoption.generatedAt)}${adoption.truncated ? " (capped)" : ""}.`,
+					...entries,
+					...(!entries.length ? ["No qualifying recommendations."] : [])
+				].join("\n")
+			)
+		]
+		// Link buttons retain every selected identity without spending Discord's
+		// text budget on URLs. Four per row keeps both eight-item catalogs visible.
+		for (let offset = 0; offset < recommendations.length; offset += 4)
+			rows.push(
+				new ComponentRow(
+					recommendations
+						.slice(offset, offset + 4)
+						.map(
+							(candidate, index) =>
+								new CandidateLink(
+									`${offset + index + 1}. ${candidate.displayName.slice(0, 32)}`,
+									new URL(candidate.url).href.length <= 512
+										? new URL(candidate.url).href
+										: dashboardUrl
+								)
+						)
+				)
+			)
+		components.push(new Container(rows))
+		for (const [title, facts] of [
+			["company opportunities", catalog.companyOpportunities],
+			["official gaps", catalog.officialGaps],
+			["movers", catalog.movers]
+		] as const)
+			supplements.push({
+				title: `${name} ${title}`,
+				rows: facts.map(
+					(row) =>
+						`${compactName(row.query)} (${row.scope}): ${row.searches} searches · ${row.officialGaps} gaps · previous ${row.previousSearches}`
+				),
+				omitted: false
+			})
+	}
+	components.push(
+		new TextDisplay(
+			"? = unavailable, not zero. Human quality, security and category-coverage review required. Full evidence and removal reasons are on the dashboard. Long links open the dashboard." +
+				(digest.truncated
+					? " Evidence details compacted; all selections retained."
+					: "")
+		)
+	)
+	const supplementaryText = () =>
+		supplements
+			.map((section) =>
+				[
+					`**${section.title}**`,
+					...section.rows,
+					...(section.omitted
+						? ["More on the dashboard."]
+						: section.rows.length
+							? []
+							: ["None qualified."])
+				].join("\n")
+			)
+			.join("\n")
+	const primaryLength = components
+		.flatMap((component) =>
+			component instanceof TextDisplay
+				? [component.content ?? ""]
+				: component.components
+						.filter(
+							(child): child is TextDisplay => child instanceof TextDisplay
+						)
+						.map((child) => child.content ?? "")
+		)
+		.join("\n").length
+	// Only auxiliary rows are compacted; the sixteen candidate identities remain.
+	// Reserve space for the delivery owner’s immutable report fingerprint.
+	while (primaryLength + supplementaryText().length > 3800) {
+		const longest = supplements
+			.filter((section) => section.rows.length)
+			.sort((a, b) => b.rows.join("\n").length - a.rows.join("\n").length)[0]
+		if (!longest) break
+		longest.rows.pop()
+		longest.omitted = true
+	}
+	components.push(new TextDisplay(supplementaryText()))
+	return serializePayload({ components, allowedMentions: { parse: [] } })
+}
+
+export const renderEvidenceDigest = (digest: EvidenceDigest | LineupDigest) => {
+	if (digest.kind === "search_intelligence_weekly_v3")
+		return renderLineupDigest(digest)
 	const preview = ["localhost", "127.0.0.1", "[::1]"].includes(
 		new URL(digest.dashboardUrl).hostname
 	)

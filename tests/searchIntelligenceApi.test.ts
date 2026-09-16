@@ -177,6 +177,79 @@ const evidencePayload = () => {
 		}
 	}
 }
+const lineupPayload = () => {
+	const base = evidencePayload()
+	const catalog = (
+		source: typeof base.catalogs.plugins | typeof base.catalogs.skills
+	) => {
+		const row = source.recommendations[0]
+		const recommendations = Array.from({ length: 8 }, (_, index) => ({
+			...row,
+			id: `${row.id}-${index}`,
+			displayName: `Discovery ${row.artifactKind} ${index}`,
+			url: `${row.url}-${index}`,
+			version: "1.0.0",
+			support: index === 0 ? "current-only" : row.support,
+			search: index === 0 ? null : row.search,
+			adoption: index === 0 ? null : row.adoption
+		}))
+		return {
+			...source,
+			recommendations,
+			lineup: {
+				targetSize: 8,
+				baseline: [
+					...recommendations.slice(0, 2).map((entry) => ({
+						id: entry.id,
+						version: entry.version,
+						featuredAt: 1
+					})),
+					{ id: `${row.id}-old`, version: "0.9.0", featuredAt: 1 }
+				],
+				changes: recommendations.map((entry, index) => ({
+					id: entry.id,
+					change: index < 2 ? "retain" : "add",
+					emerging: index === 7
+				})),
+				removals: [
+					{
+						id: `${row.id}-old`,
+						displayName: "Previous selection",
+						url: `${row.url}-old`,
+						reasons: ["outside-proposed-set"]
+					}
+				],
+				shortfall: 0
+			}
+		}
+	}
+	return {
+		...base,
+		kind: "search_intelligence_weekly_v3",
+		catalogs: {
+			plugins: catalog(base.catalogs.plugins),
+			skills: catalog(base.catalogs.skills)
+		}
+	}
+}
+const links = (value: unknown): string[] => {
+	if (!value || typeof value !== "object") return []
+	const row = value as { url?: string; components?: unknown[] }
+	return [
+		...(row.url ? [row.url] : []),
+		...(row.components ?? []).flatMap(links)
+	]
+}
+const componentCount = (value: unknown): number => {
+	if (!value || typeof value !== "object") return 0
+	return (
+		1 +
+		((value as { components?: unknown[] }).components ?? []).reduce<number>(
+			(total, child) => total + componentCount(child),
+			0
+		)
+	)
+}
 let mockClock: ReturnType<typeof spyOn<typeof Date, "now">> | undefined
 const owners: SqliteD1Database[] = []
 const setup = () => {
@@ -238,6 +311,237 @@ afterEach(() => {
 })
 
 describe("ClawHub weekly search intelligence receiver", () => {
+	it("delivers and replays the complete eight-per-catalog lineup without dropping long links", async () => {
+		const { client, posts } = setup()
+		const payload = lineupPayload()
+		for (const catalog of Object.values(payload.catalogs))
+			for (const row of catalog.recommendations)
+				row.url += "?detail=" + "x".repeat(500)
+		const before = JSON.stringify(payload)
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		expect(posts).toHaveLength(1)
+		const components = posts[0].body.components as unknown[]
+		const text = components.flatMap(texts).join("\n")
+		expect(text.length).toBeLessThanOrEqual(3900)
+		expect(
+			components.reduce<number>((total, row) => total + componentCount(row), 0)
+		).toBeLessThanOrEqual(40)
+		expect(components.flatMap(links)).toHaveLength(17)
+		expect(components.flatMap(links).every((url) => url.length <= 512)).toBe(
+			true
+		)
+		expect(text).toContain("Long links open the dashboard")
+		for (const catalog of Object.values(payload.catalogs))
+			for (const row of catalog.recommendations)
+				expect(text).toContain(row.displayName)
+		for (const expected of [
+			"Plugins: 8/8",
+			"Skills: 8/8",
+			"Keep",
+			"Add",
+			"Emerging",
+			"1 proposed removals",
+			"window evidence unavailable",
+			"341 downloads"
+		])
+			expect(text).toContain(expected)
+		expect(text).toContain("notion")
+		expect(JSON.stringify(payload)).toBe(before)
+		expect(posts[0].body.allowed_mentions).toEqual({ parse: [] })
+	})
+	it("shows bookmarks when they support an adoption-only recommendation", async () => {
+		const { client, posts } = setup()
+		const payload = lineupPayload()
+		const row = payload.catalogs.skills.recommendations[2]
+		row.adoption = {
+			...row.adoption!,
+			downloads: 0,
+			installs: 0,
+			bookmarks: 11
+		}
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		expect(
+			(posts[0].body.components as unknown[]).flatMap(texts).join("\n")
+		).toContain("11 bookmarks")
+	})
+	it("preserves all sixteen selections within the message budget at contract bounds", async () => {
+		const { client, posts } = setup()
+		const payload = lineupPayload()
+		for (const catalog of Object.values(payload.catalogs)) {
+			catalog.adoption.truncated = true
+			catalog.totalSearches = Number.MAX_SAFE_INTEGER
+			catalog.sourceCounts = {
+				clawhubWeb: Number.MAX_SAFE_INTEGER,
+				openclawControlUi: 0
+			}
+			for (const row of catalog.recommendations) {
+				row.displayName = "_".repeat(120)
+				row.support = "both"
+				row.search = {
+					...evidencePayload().catalogs.plugins.recommendations[0].search
+				}
+				row.adoption = {
+					...evidencePayload().catalogs[
+						row.artifactKind === "plugin" ? "plugins" : "skills"
+					].recommendations[0].adoption
+				}
+				if (row.search) {
+					row.search = {
+						...row.search,
+						matchedSearches7d: Number.MAX_SAFE_INTEGER,
+						previous7d: 0,
+						searches30d: Number.MAX_SAFE_INTEGER,
+						queries: [],
+						omittedQueries: 1
+					}
+				}
+				if (row.adoption) {
+					row.adoption.downloads = Number.MAX_SAFE_INTEGER
+					row.adoption.installs = Number.MAX_SAFE_INTEGER
+				}
+			}
+			for (const change of catalog.lineup.changes) change.emerging = true
+		}
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		const components = posts[0].body.components as unknown[]
+		expect(components.flatMap(texts).join("\n").length).toBeLessThanOrEqual(
+			3900
+		)
+		expect(components.flatMap(links)).toHaveLength(17)
+	})
+	it("validates complete lineup membership and privacy before touching delivery state", async () => {
+		const { client, posts, owner } = setup()
+		const edits: ((payload: ReturnType<typeof lineupPayload>) => void)[] = [
+			(payload) => {
+				payload.catalogs.plugins.lineup.shortfall = 1
+			},
+			(payload) => {
+				payload.catalogs.plugins.lineup.changes[0].change = "add"
+			},
+			(payload) => {
+				payload.catalogs.plugins.lineup.removals = []
+			},
+			(payload) => {
+				payload.catalogs.plugins.lineup.baseline.push(
+					payload.catalogs.plugins.lineup.baseline[0]
+				)
+			},
+			(payload) => {
+				payload.catalogs.skills.recommendations.push({
+					...payload.catalogs.skills.recommendations[7],
+					id: "ninth"
+				})
+			},
+			(payload) => {
+				Object.assign(payload.catalogs.skills.lineup, { userId: "private" })
+			},
+			(payload) => {
+				payload.catalogs.plugins.recommendations[1].search!.queries[0].searches7d = 2
+			},
+			(payload) => {
+				payload.catalogs.skills.recommendations[2].support = "current-only"
+				payload.catalogs.skills.recommendations[2].adoption = null
+			},
+			(payload) => {
+				payload.catalogs.plugins.lineup.removals[0].url = "https://evil.example"
+			}
+		]
+		for (const edit of edits) {
+			const payload = lineupPayload()
+			edit(payload)
+			expect(
+				(await handleSearchIntelligenceApiRequest(request(payload), client))
+					?.status
+			).toBe(400)
+		}
+		expect(posts).toHaveLength(0)
+		expect(
+			owner.database.query("SELECT count(*) AS count FROM keyValue").get()
+		).toEqual({ count: 0 })
+	})
+	it("keeps a full-set candidate with rare search counts while suppressing its query text", async () => {
+		const { client, posts } = setup()
+		const payload = lineupPayload()
+		const row = payload.catalogs.plugins.recommendations[2]
+		row.support = "search-only"
+		row.adoption = null
+		row.search = {
+			...row.search!,
+			matchedSearches7d: 1,
+			previous7d: 0,
+			searches30d: 1,
+			queries: [],
+			omittedQueries: 1
+		}
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		expect(JSON.stringify(posts[0].body)).toContain("1 searches")
+	})
+	it("requires candidate link identity as well as text when reconciling a lost full-lineup response", async () => {
+		const { client, posts } = setup()
+		const payload = lineupPayload()
+		const original = client.rest.post.bind(client.rest)
+		client.rest.post = (async (...args: Parameters<typeof original>) => {
+			await original(...args)
+			throw new Error("response lost")
+		}) as typeof client.rest.post
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(503)
+		const altered = JSON.parse(
+			JSON.stringify(posts[0].body.components).replace(
+				payload.catalogs.plugins.recommendations[0].url,
+				"https://clawhub.ai/plugins/other"
+			)
+		)
+		const history = (components: unknown) => [
+			{
+				id: "message-1",
+				author: { id: "bot-user", bot: true },
+				timestamp: new Date().toISOString(),
+				components
+			}
+		]
+		client.rest.get = async () => history(altered)
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(503)
+		const wrongReport = JSON.parse(
+			JSON.stringify(posts[0].body.components).replace(
+				/Report [a-f0-9]{64}/,
+				`Report ${"0".repeat(64)}`
+			)
+		)
+		client.rest.get = async () => history(wrongReport)
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(503)
+		client.rest.get = async () => history(posts[0].body.components)
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		expect(posts).toHaveLength(1)
+	})
+
 	it("renders separate catalog evidence, including adoption-supported skills with no searches", async () => {
 		const { client, posts } = setup()
 		expect(
