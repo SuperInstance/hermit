@@ -122,36 +122,57 @@ try {
 			.bind(key)
 			.first<{ value: string }>()
 		const receipt = row ? JSON.parse(row.value) : null
-		proofStep = "read-confirmed-discord-message"
-		const message = receipt?.messageId
-			? ((await client.rest.get(
-					Routes.channelMessage(channel.id, receipt.messageId)
-				)) as {
-					id: string
-					author: { id: string }
-					flags: number
-					components: unknown[]
-					mentions: unknown[]
-					mention_roles: unknown[]
-					mention_everyone: boolean
-				})
-			: null
+		proofStep = "read-confirmed-discord-messages"
+		// V4 freezes the whole report at the weekly key; message IDs live on
+		// its deterministic part receipts. Older weeks keep their single receipt.
+		const partReceipts =
+			receipt?.version === 2
+				? await Promise.all(
+						receipt.partHashes.map(async (_hash: string, index: number) => {
+							const part = await proxy.env.DB.withSession("first-primary")
+								.prepare("SELECT value FROM keyValue WHERE key = ?")
+								.bind(`${key}:part:${index + 1}`)
+								.first<{ value: string }>()
+							return part ? JSON.parse(part.value) : null
+						})
+					)
+				: [receipt]
+		const confirmed = partReceipts.filter(
+			(part) => part?.status === "sent" && part.messageId
+		)
+		const messages = await Promise.all(
+			confirmed.map(
+				async (part) =>
+					(await client.rest.get(
+						Routes.channelMessage(channel.id, part.messageId)
+					)) as {
+						id: string
+						author: { id: string }
+						flags: number
+						components: unknown[]
+						mentions: unknown[]
+						mention_roles: unknown[]
+						mention_everyone: boolean
+					}
+			)
+		)
+		const discordParts = messages.map((message) => ({
+			url: `https://discord.com/channels/${channel.guild_id}/${channel.id}/${message.id}`,
+			botId: message.author.id,
+			flags: message.flags,
+			components: message.components,
+			mentionCount: message.mentions.length,
+			roleMentionCount: message.mention_roles.length,
+			mentionEveryone: message.mention_everyone
+		}))
+
 		const evidence = {
 			mode: "local Hermit production handler + local persistent D1 + real Discord test bot; NOT deployed production Hermit",
 			first: { status: first?.status, body: await first?.json() },
 			duplicate: { status: replay?.status, body: await replay?.json() },
 			receipt,
-			discord: message
-				? {
-						url: `https://discord.com/channels/${channel.guild_id}/${channel.id}/${message.id}`,
-						botId: message.author.id,
-						flags: message.flags,
-						components: message.components,
-						mentionCount: message.mentions.length,
-						roleMentionCount: message.mention_roles.length,
-						mentionEveryone: message.mention_everyone
-					}
-				: null
+			discord: discordParts[0] ?? null,
+			discordParts
 		}
 		await writeFile(
 			resolve(directory, "evidence.json"),
@@ -163,18 +184,24 @@ try {
 				duplicateStatus: replay?.status,
 				delivered: receipt?.status === "sent",
 				discordUrl: evidence.discord?.url,
+				discordUrls: discordParts.map((part) => part.url),
 				evidencePath: resolve(directory, "evidence.json")
 			})
 		)
 		if (
 			first?.status !== 200 ||
 			replay?.status !== 200 ||
-			!message ||
-			message.flags !== 32768 ||
-			message.author.id !== botId ||
-			message.mentions.length ||
-			message.mention_roles.length ||
-			message.mention_everyone
+			receipt?.status !== "sent" ||
+			messages.length !== partReceipts.length ||
+			!messages.length ||
+			messages.some(
+				(message) =>
+					message.flags !== 32768 ||
+					message.author.id !== botId ||
+					message.mentions.length ||
+					message.mention_roles.length ||
+					message.mention_everyone
+			)
 		)
 			process.exitCode = 1
 	}

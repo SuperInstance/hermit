@@ -1,4 +1,11 @@
 import {
+	validMonthlyAdoption,
+	validMonthlySummary,
+	validMonthlyLineup,
+	renderMonthlyDigest,
+	type MonthlyDigest
+} from "./monthly.js"
+import {
 	Container,
 	LinkButton,
 	Row as ComponentRow,
@@ -63,11 +70,11 @@ type Recommendation = {
 		lifetimeInstalls: number | null
 	}
 }
-type LineupRecommendation = Omit<Recommendation, "support"> & {
+export type LineupRecommendation = Omit<Recommendation, "support"> & {
 	version: string | null
 	support: Recommendation["support"] | "current-only"
 }
-type FeaturedLineup = {
+export type FeaturedLineup = {
 	targetSize: 8
 	baseline: { id: string; version: string | null; featuredAt: number }[]
 	changes: { id: string; change: "retain" | "add"; emerging: boolean }[]
@@ -79,7 +86,7 @@ type FeaturedLineup = {
 	}[]
 	shortfall: number
 }
-type Catalog = Pick<
+export type Catalog = Pick<
 	Digest,
 	| "totalSearches"
 	| "sourceCounts"
@@ -119,7 +126,7 @@ type LineupCatalog = Omit<Catalog, "recommendations"> & {
 	recommendations: LineupRecommendation[]
 	lineup: FeaturedLineup
 }
-type LineupDigest = Omit<EvidenceDigest, "kind" | "catalogs"> & {
+export type LineupDigest = Omit<EvidenceDigest, "kind" | "catalogs"> & {
 	kind: "search_intelligence_weekly_v3"
 	catalogs: { plugins: LineupCatalog; skills: LineupCatalog }
 }
@@ -132,7 +139,7 @@ const period = (start: unknown, end: unknown) =>
 	nullable(end, timestamp) &&
 	(start === null || end === null || (start as number) < (end as number))
 
-const validAdoptionSummary = (value: unknown) =>
+const validAdoptionSummary = (value: unknown, monthly = false) =>
 	fields(value, [
 		"status",
 		"generatedAt",
@@ -142,7 +149,16 @@ const validAdoptionSummary = (value: unknown) =>
 		"rankingVersion",
 		"totalItems",
 		"inspectedItems",
-		"truncated"
+		"truncated",
+		...(monthly
+			? [
+					"collectionStartedAt",
+					"periodStart7d",
+					"scannedRows",
+					"importedRows",
+					"importDatasetVersions"
+				]
+			: [])
 	]) &&
 	(value.status === "available" || value.status === "unavailable") &&
 	nullable(value.generatedAt, timestamp) &&
@@ -161,7 +177,8 @@ const validRecommendation = (
 	weekStart: number,
 	weekEnd: number,
 	totalSearches: number,
-	fullLineup = false
+	fullLineup = false,
+	monthly = false
 ) => {
 	if (
 		!fields(value, [
@@ -174,7 +191,8 @@ const validRecommendation = (
 			"metadataCheckedAt",
 			"search",
 			"adoption",
-			...(fullLineup ? ["version"] : [])
+			...(fullLineup ? ["version"] : []),
+			...(monthly ? ["slot", "selectionBasis", "reason"] : [])
 		]) ||
 		value.artifactKind !== kind ||
 		!string(value.id, 256) ||
@@ -247,7 +265,9 @@ const validRecommendation = (
 			return false
 	}
 	const adoption = value.adoption
-	if (adoption !== null) {
+	if (adoption !== null && monthly) {
+		if (!validMonthlyAdoption(adoption, kind)) return false
+	} else if (adoption !== null) {
 		if (
 			!fields(adoption, [
 				"source",
@@ -304,7 +324,8 @@ const validRecommendation = (
 const validLineup = (
 	value: unknown,
 	recommendations: LineupRecommendation[],
-	origins: string[]
+	origins: string[],
+	monthly = false
 ) => {
 	if (
 		!fields(value, [
@@ -312,10 +333,22 @@ const validLineup = (
 			"baseline",
 			"changes",
 			"removals",
-			"shortfall"
+			"shortfall",
+			...(monthly
+				? [
+						"reservedSlots",
+						"telemetryTarget",
+						"pendingCount",
+						"telemetryShortfall",
+						"editorialRevision",
+						"currentEditorialRevision",
+						"staleEditorial",
+						"reservations"
+					]
+				: [])
 		]) ||
-		value.targetSize !== 8 ||
-		value.shortfall !== 8 - recommendations.length ||
+		value.targetSize !== (monthly ? 16 : 8) ||
+		value.shortfall !== (monthly ? 16 : 8) - recommendations.length ||
 		!Array.isArray(value.baseline) ||
 		value.baseline.length > 100 ||
 		!value.baseline.every(
@@ -368,7 +401,8 @@ const validLineup = (
 			(entry) => selected.has(entry.id) || removed.has(entry.id)
 		) &&
 		recommendations.every(
-			(entry) => entry.support !== "current-only" || baseline.has(entry.id)
+			(entry) =>
+				monthly || entry.support !== "current-only" || baseline.has(entry.id)
 		)
 	)
 }
@@ -376,7 +410,7 @@ const validLineup = (
 export const parseEvidenceDigest = (
 	value: unknown,
 	origins: string[]
-): EvidenceDigest | LineupDigest | null => {
+): EvidenceDigest | LineupDigest | MonthlyDigest | null => {
 	if (
 		!fields(value, [
 			"kind",
@@ -388,12 +422,14 @@ export const parseEvidenceDigest = (
 			"catalogs"
 		]) ||
 		(value.kind !== "search_intelligence_weekly_v2" &&
-			value.kind !== "search_intelligence_weekly_v3") ||
+			value.kind !== "search_intelligence_weekly_v3" &&
+			value.kind !== "search_intelligence_weekly_v4") ||
 		!fields(value.catalogs, ["plugins", "skills"]) ||
 		new TextEncoder().encode(JSON.stringify(value)).byteLength > 30_000
 	)
 		return null
-	const fullLineup = value.kind === "search_intelligence_weekly_v3"
+	const monthly = value.kind === "search_intelligence_weekly_v4"
+	const fullLineup = monthly || value.kind === "search_intelligence_weekly_v3"
 	for (const [name, kind] of [
 		["plugins", "plugin"],
 		["skills", "skill"]
@@ -413,7 +449,9 @@ export const parseEvidenceDigest = (
 				"recommendations",
 				...(fullLineup ? ["lineup"] : [])
 			]) ||
-			!validAdoptionSummary(catalog.adoption)
+			!validAdoptionSummary(catalog.adoption, monthly) ||
+			(monthly &&
+				!validMonthlySummary(catalog.adoption, value.weekEnd as number))
 		)
 			return null
 		const unscoped: Record<string, unknown[]> = {}
@@ -459,7 +497,7 @@ export const parseEvidenceDigest = (
 		if (
 			!summary ||
 			!Array.isArray(catalog.recommendations) ||
-			catalog.recommendations.length > (fullLineup ? 8 : 5) ||
+			catalog.recommendations.length > (monthly ? 16 : fullLineup ? 8 : 5) ||
 			!catalog.recommendations.every((candidate) =>
 				validRecommendation(
 					candidate,
@@ -468,7 +506,8 @@ export const parseEvidenceDigest = (
 					summary.weekStart,
 					summary.weekEnd,
 					summary.totalSearches,
-					fullLineup
+					fullLineup,
+					monthly
 				)
 			) ||
 			new Set(catalog.recommendations.map((candidate) => candidate.id)).size !==
@@ -484,12 +523,18 @@ export const parseEvidenceDigest = (
 			!validLineup(
 				catalog.lineup,
 				catalog.recommendations as LineupRecommendation[],
-				origins
+				origins,
+				monthly
 			)
 		)
 			return null
+		if (
+			monthly &&
+			!validMonthlyLineup(catalog.lineup, catalog.recommendations, kind)
+		)
+			return null
 	}
-	return value as unknown as EvidenceDigest | LineupDigest
+	return value as unknown as EvidenceDigest | LineupDigest | MonthlyDigest
 }
 
 const safe = (value: string) =>
@@ -683,7 +728,11 @@ const renderLineupDigest = (digest: LineupDigest) => {
 	return serializePayload({ components, allowedMentions: { parse: [] } })
 }
 
-export const renderEvidenceDigest = (digest: EvidenceDigest | LineupDigest) => {
+export const renderEvidenceDigest = (
+	digest: EvidenceDigest | LineupDigest | MonthlyDigest
+) => {
+	if (digest.kind === "search_intelligence_weekly_v4")
+		return renderMonthlyDigest(digest)
 	if (digest.kind === "search_intelligence_weekly_v3")
 		return renderLineupDigest(digest)
 	const preview = ["localhost", "127.0.0.1", "[::1]"].includes(

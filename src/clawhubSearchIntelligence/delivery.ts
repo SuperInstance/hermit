@@ -107,32 +107,111 @@ const findDeliveredMessage = async (
 	return null
 }
 
+type DigestIdentity = {
+	kind?: string
+	weekStart: number
+	weekEnd: number
+	dashboardUrl: string
+}
+type MessageBody = ReturnType<typeof serializePayload>
+const fingerprint = (body: MessageBody, value: string): MessageBody => ({
+	...body,
+	components: [
+		...(body.components ?? []),
+		...(serializePayload({
+			components: [new TextDisplay(`-# Report ${value}`)]
+		}).components ?? [])
+	]
+})
 export const deliverWeeklyDigest = async (
 	client: Client,
-	digest: {
-		kind?: string
-		weekStart: number
-		weekEnd: number
-		dashboardUrl: string
-	},
-	body: ReturnType<typeof serializePayload>
+	digest: DigestIdentity,
+	rendered: MessageBody | MessageBody[]
 ): Promise<Response> => {
-	const db = getRuntimeEnv().DB.withSession("first-primary")
 	const key = `clawhub-search-weekly:${new URL(digest.dashboardUrl).origin}:${digest.weekStart}`
 	const payloadHash = await hash(canonical(digest))
-	if (digest.kind === "search_intelligence_weekly_v3") {
-		// Long candidate URLs may share a dashboard button. The full payload's
-		// fingerprint preserves exact report identity during uncertain-send recovery.
-		body = {
-			...body,
-			components: [
-				...(body.components ?? []),
-				...(serializePayload({
-					components: [new TextDisplay(`-# Report ${payloadHash}`)]
-				}).components ?? [])
-			]
-		}
+	if (!Array.isArray(rendered))
+		return deliverMessage(
+			client,
+			digest,
+			digest.kind === "search_intelligence_weekly_v3"
+				? fingerprint(rendered, payloadHash)
+				: rendered,
+			key,
+			payloadHash
+		)
+	// The existing weekly key freezes the whole report. Each deterministic part
+	// uses the same claim/reconciliation owner; a lost part never resends prior parts.
+	const db = getRuntimeEnv().DB.withSession("first-primary")
+	const startedAt = Date.now()
+	const partHashes = await Promise.all(
+		rendered.map((body) => hash(canonical(body)))
+	)
+	const claim = {
+		version: 2,
+		hash: payloadHash,
+		status: "sending",
+		startedAt,
+		partHashes
 	}
+	const serialized = JSON.stringify(claim)
+	await db
+		.prepare(
+			"INSERT INTO keyValue (key, value, createdAt, updatedAt) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO NOTHING RETURNING key"
+		)
+		.bind(key, serialized, startedAt, startedAt)
+		.first()
+	const existing = await db
+		.prepare("SELECT value FROM keyValue WHERE key = ?")
+		.bind(key)
+		.first<{ value: string }>()
+	if (!existing) return response({ error: "Delivery state unavailable" }, 503)
+	const state = JSON.parse(existing.value) as typeof claim
+	if (
+		state.hash !== payloadHash ||
+		state.version !== 2 ||
+		canonical(state.partHashes) !== canonical(partHashes)
+	)
+		return response({ error: "Weekly payload conflict" }, 409)
+	const success = () =>
+		response({ ok: true, delivered: true, weekEnd: digest.weekEnd })
+	if (state.status === "sent") return success()
+	for (let index = 0; index < rendered.length; index++) {
+		const result = await deliverMessage(
+			client,
+			digest,
+			fingerprint(
+				rendered[index],
+				`${payloadHash} · ${index + 1}/${rendered.length}`
+			),
+			`${key}:part:${index + 1}`,
+			payloadHash
+		)
+		if (!result.ok) return result
+	}
+	const saved = await db
+		.prepare(
+			"UPDATE keyValue SET value = ?, updatedAt = ? WHERE key = ? AND value = ? RETURNING key"
+		)
+		.bind(
+			JSON.stringify({ ...state, status: "sent" }),
+			Date.now(),
+			key,
+			existing.value
+		)
+		.first()
+	return saved
+		? success()
+		: response({ error: "Delivery receipt pending" }, 503)
+}
+const deliverMessage = async (
+	client: Client,
+	digest: DigestIdentity,
+	body: MessageBody,
+	key: string,
+	payloadHash: string
+): Promise<Response> => {
+	const db = getRuntimeEnv().DB.withSession("first-primary")
 	const claim: Delivery = {
 		version: 1,
 		hash: payloadHash,

@@ -6,8 +6,8 @@ Companion to [CLAW-768](https://linear.app/my-openclaw/issue/CLAW-768) under
 ## Boundary and ownership
 
 `POST /api/clawhub-search-intelligence/weekly` accepts ClawHub's frozen
-`search_intelligence_weekly_v2` digest and previously frozen `plugin_search_weekly`
-digests. It uses the existing `CLAWHUB_HERMIT_TOKEN`
+`search_intelligence_weekly_v4` digest and previously frozen v3, v2 and
+`plugin_search_weekly` digests. It uses the existing `CLAWHUB_HERMIT_TOKEN`
 (fallback `CLAWHUB_BAN_APPEALS_TOKEN`) and `CLAWHUB_SITE_URL` trusted-origin
 configuration. Destination is `formSettings.clawhubAppealReviewChannelId`, the
 `maintainer-clawhub` channel. No role or user is mentioned.
@@ -68,12 +68,49 @@ claimed legacy week or cause a second message for it. Deploy receiver support
 before enabling the v2 sender. A read-only report/dry run does not call this POST
 endpoint; invoking it requests delivery.
 
+## Monthly Featured lineups (v4)
+
+V4 carries 16 slots per catalog. Plugins reserve eight editorial slots and use
+eight deduplicated telemetry slots; skills use 16 telemetry slots. ClawHub owns
+eligibility and order: installs across 30 completed UTC days, then installs in the
+final seven days, then stable artifact ID. Search counts, downloads, official
+status and current Featured membership do not improve that order. Editorial
+reservations retain their rationale; pending entries stay pending instead of
+being replaced with telemetry choices. A changed editorial revision is visibly
+stale and requires a regenerated report before approval.
+
+Each catalog carries the exact monthly window, aggregate scan start/end, scanned
+and imported row counts, and import dataset provenance. The scan is not an atomic
+snapshot. Search evidence still has its separate completed-week window and query
+privacy threshold. Missing adoption stays unavailable, not zero. Hermit neither
+re-ranks the report nor publishes Featured selections.
+
+The compact Carbon layout retains every proposed ID, slot, selection basis,
+30d/7d install count and rationale, metadata freshness, plus all pending reservations.
+Weekly search totals, source counts, coverage and bounded company-opportunity,
+official-gap and mover rows remain separate sections. The complete
+wire payload remains capped at 30,000 bytes. Reports that fit use one message;
+longer reports are packed deterministically into bounded parts, without dropping
+selection rows or reasons. Each part uses at most 4000 text characters and 40
+components, with a dashboard link for full search links and removal details.
+
+V4 freezes the complete digest hash and ordered rendered-part hashes at the same
+origin/week key. Each part reuses the existing message receipt, nonce and
+uncertain-send reconciliation owner at a derived part key. Only all confirmed
+parts yield overall success. A rejected part may retry; confirmed earlier parts
+are skipped. An uncertain part must reconcile before later parts can proceed.
+A changed report or rendering manifest conflicts instead of silently replacing a
+partially delivered week. Frozen v1/v2/v3 payloads retain their original validation,
+rendering, hashes and single-message receipts. Deploy receiver support before
+sending v4. Read-only dry runs must not call the delivery endpoint.
+
 ## Delivery state and failure semantics
 
 No migration is needed. The existing D1 `keyValue` primary key stores one receipt
-per trusted origin and UTC week. The record contains a version, canonical digest
-hash, delivery status, start timestamp, and confirmed Discord message ID; it
-contains no query text. Reads use a `first-primary` D1 session. Atomic
+per trusted origin and UTC week, plus v4 part receipts when applicable. Legacy
+message records contain a version, canonical digest
+hash, delivery status, start timestamp, and confirmed Discord message ID; receipts
+contain no query text. Reads use a `first-primary` D1 session. Atomic
 `INSERT ... ON CONFLICT DO NOTHING RETURNING` and compare-and-swap updates fence
 concurrent requests and freeze the weekly payload.
 

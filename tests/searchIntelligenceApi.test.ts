@@ -232,6 +232,96 @@ const lineupPayload = () => {
 		}
 	}
 }
+const monthlyPayload = (longReasons = false) => {
+	const base = evidencePayload()
+	const catalog = (
+		source: typeof base.catalogs.plugins | typeof base.catalogs.skills
+	) => {
+		const row = source.recommendations[0]
+		const plugin = row.artifactKind === "plugin"
+		const recommendations = Array.from({ length: 16 }, (_, slot) => ({
+			...row,
+			id: `${row.id}-${slot}`,
+			displayName: `Discovery ${row.artifactKind} ${slot}`,
+			url: `${row.url}-${slot}`,
+			version: "1.0.0",
+			slot,
+			selectionBasis: plugin && slot < 8 ? "editorial" : "telemetry",
+			reason:
+				plugin && slot < 8
+					? longReasons
+						? "_".repeat(480)
+						: "Useful workflow."
+					: "Monthly install priority.",
+			support: "adoption-only",
+			search: null,
+			adoption: {
+				source: plugin ? "package-daily-installs" : "skill-daily-installs",
+				rank: slot + 1,
+				installs30d: 100 - slot,
+				installs7d: 30 - slot,
+				importedRows: 0,
+				importDatasetVersions: [] as string[]
+			}
+		}))
+		return {
+			...source,
+			recommendations,
+			adoption: {
+				...source.adoption,
+				totalItems: 16,
+				inspectedItems: 16,
+				periodStart: base.weekEnd - 30 * 86400000,
+				periodStart7d: base.weekStart,
+				collectionStartedAt: base.weekEnd,
+				scannedRows: 480,
+				importedRows: 0,
+				importDatasetVersions: [] as string[]
+			},
+			lineup: {
+				targetSize: 16,
+				baseline: [] as {
+					id: string
+					version: string | null
+					featuredAt: number
+				}[],
+				changes: recommendations.map(({ id }) => ({
+					id,
+					change: "add",
+					emerging: false
+				})),
+				removals: [],
+				shortfall: 0,
+				reservedSlots: plugin ? 8 : 0,
+				telemetryTarget: plugin ? 8 : 16,
+				pendingCount: 0,
+				telemetryShortfall: 0,
+				editorialRevision: plugin ? 1 : 0,
+				currentEditorialRevision: plugin ? 1 : 0,
+				staleEditorial: false,
+				reservations: plugin
+					? recommendations.slice(0, 8).map((row) => ({
+							slot: row.slot,
+							id: row.id,
+							name: row.id.slice(7),
+							displayName: row.displayName,
+							reason: row.reason,
+							status: "ready",
+							pendingReasons: [] as string[]
+						}))
+					: []
+			}
+		}
+	}
+	return {
+		...base,
+		kind: "search_intelligence_weekly_v4",
+		catalogs: {
+			plugins: catalog(base.catalogs.plugins),
+			skills: catalog(base.catalogs.skills)
+		}
+	}
+}
 const links = (value: unknown): string[] => {
 	if (!value || typeof value !== "object") return []
 	const row = value as { url?: string; components?: unknown[] }
@@ -311,6 +401,362 @@ afterEach(() => {
 })
 
 describe("ClawHub weekly search intelligence receiver", () => {
+	it("delivers every monthly slot and replays the immutable complete report", async () => {
+		const { client, posts } = setup()
+		const payload = monthlyPayload()
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		const rendered = posts.flatMap(({ body }) => texts(body)).join("\n")
+		for (const catalog of Object.values(payload.catalogs))
+			for (const row of catalog.recommendations) {
+				expect(rendered).toContain(row.id)
+				expect(rendered).toContain(
+					`${row.adoption.installs30d} / ${row.adoption.installs7d}`
+				)
+			}
+		for (const { body } of posts) {
+			expect(texts(body).join("\n").length).toBeLessThanOrEqual(4000)
+			expect(componentCount(body) - 1).toBeLessThanOrEqual(40)
+			expect(body.allowed_mentions).toEqual({ parse: [] })
+		}
+		const count = posts.length
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		expect(posts).toHaveLength(count)
+	})
+
+	it("preserves weekly search totals, coverage and every existing nonempty section in v4", async () => {
+		const { client, posts } = setup()
+		const payload = monthlyPayload()
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		const rendered = posts.flatMap(({ body }) => texts(body)).join("\n")
+		for (const title of ["company opportunities", "official gaps", "movers"]) {
+			expect(rendered).toContain(`Plugins ${title}`)
+			expect(rendered).toContain(`Skills ${title}`)
+		}
+		expect(rendered).toContain("12 searches · Web 8 · Control UI 4")
+		expect(rendered).toContain(
+			"notion (catalog): 5 searches · previous 3 · 5 official gaps"
+		)
+		expect(rendered).toContain("collection started 2026-08-01")
+		expect(rendered).toContain("Metadata checked 2026-09-07")
+		expect(rendered).toContain(
+			payload.catalogs.skills.recommendations[0].displayName
+		)
+		expect(rendered).toContain("None qualified.")
+		for (const { body } of posts)
+			expect(texts(body).join("\n").length).toBeLessThanOrEqual(4000)
+	})
+
+	it.each([
+		[false, false],
+		[true, false],
+		[false, true],
+		[true, true]
+	])(
+		"shows monthly evidence limitations independently (digest %s, adoption %s)",
+		async (digestLimited, adoptionLimited) => {
+			const { client, posts } = setup()
+			const payload = monthlyPayload()
+			payload.truncated = digestLimited
+			Object.assign(payload.catalogs.plugins.adoption, {
+				totalItems: 101,
+				inspectedItems: 100,
+				truncated: adoptionLimited
+			})
+			expect(
+				(await handleSearchIntelligenceApiRequest(request(payload), client))
+					?.status
+			).toBe(200)
+			const rendered = posts.flatMap(({ body }) => texts(body)).join("\n")
+			expect(
+				rendered.includes(
+					"Some evidence details omitted; all proposed slots retained."
+				)
+			).toBe(digestLimited)
+			expect(
+				rendered.includes(
+					"Plugins adoption metadata limited; inspected 100 of 101 candidates."
+				)
+			).toBe(adoptionLimited)
+			expect(rendered).not.toContain("Skills adoption metadata limited")
+			for (const catalog of Object.values(payload.catalogs))
+				for (const row of catalog.recommendations)
+					expect(rendered).toContain(row.id)
+			for (const { body } of posts)
+				expect(texts(body).join("\n").length).toBeLessThanOrEqual(4000)
+		}
+	)
+
+	it("keeps pending editorial slots, full rationales and unavailable counts distinct", async () => {
+		const { client, posts } = setup()
+		const payload = monthlyPayload()
+		const plugins = payload.catalogs.plugins
+		const pending = plugins.lineup.reservations[3]
+		pending.status = "pending"
+		pending.reason = "_".repeat(500)
+		pending.pendingReasons = Array.from(
+			{ length: 12 },
+			(_, i) => `Reason ${i} ` + "_".repeat(230)
+		)
+		plugins.recommendations = plugins.recommendations.filter(
+			({ slot }) => slot !== 3
+		)
+		plugins.lineup.changes = plugins.lineup.changes.filter(
+			({ id }) => id !== pending.id
+		)
+		plugins.lineup.pendingCount = 1
+		plugins.lineup.shortfall = 1
+		plugins.lineup.currentEditorialRevision++
+		plugins.lineup.staleEditorial = true
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		const rendered = posts.flatMap(({ body }) => texts(body)).join("\n")
+		expect(rendered).toContain(`${pending.id} · editorial PENDING`)
+		expect(rendered).toContain("1 pending editorial; 0 telemetry shortfall")
+		expect(rendered).toContain("regenerate before approval")
+		for (let i = 0; i < 12; i++) expect(rendered).toContain(`Reason ${i}`)
+		for (const { body } of posts)
+			expect(texts(body).join("\n").length).toBeLessThanOrEqual(4000)
+	})
+	it("rejects monthly privacy, source, slot and period violations before durable claims", async () => {
+		const { client, owner, posts } = setup()
+		const mutations: ((p: ReturnType<typeof monthlyPayload>) => void)[] = [
+			(p) => {
+				Object.assign(p.catalogs.plugins.recommendations[0].adoption, {
+					userId: "private"
+				})
+			},
+			(p) => {
+				p.catalogs.skills.recommendations[0].adoption.source =
+					"package-daily-installs"
+			},
+			(p) => {
+				p.catalogs.plugins.adoption.periodStart++
+			},
+			(p) => {
+				p.catalogs.skills.adoption.periodStart7d++
+			},
+			(p) => {
+				p.catalogs.plugins.adoption.importedRows = 481
+			},
+			(p) => {
+				p.catalogs.skills.recommendations[0].adoption.installs7d = 101
+			},
+			(p) => {
+				p.catalogs.skills.recommendations[0].slot = 1
+			},
+			(p) => {
+				p.catalogs.plugins.lineup.reservations[0].id = "plugin:different"
+			},
+			(p) => {
+				p.catalogs.plugins.lineup.reservations[0].status = "pending"
+			},
+			(p) => {
+				p.catalogs.plugins.lineup.reservations[0].reason = "Different reason"
+			},
+			(p) => {
+				p.catalogs.skills.recommendations[0].selectionBasis = "editorial"
+			},
+			(p) => {
+				p.catalogs.plugins.lineup.staleEditorial = true
+			},
+			(p) => {
+				p.catalogs.plugins.lineup.telemetryShortfall = 1
+			},
+			(p) => {
+				p.catalogs.skills.recommendations[0].adoption.installs30d = 0
+			},
+			(p) => {
+				Object.assign(p.catalogs.plugins.recommendations[0], {
+					support: "both",
+					search: {
+						...evidencePayload().catalogs.plugins.recommendations[0].search,
+						queries: [
+							{
+								query: "rare",
+								scope: "catalog",
+								searches7d: 2,
+								previous7d: 0,
+								searches30d: 2
+							}
+						]
+					}
+				})
+			}
+		]
+		for (const mutate of mutations) {
+			const payload = monthlyPayload()
+			mutate(payload)
+			expect(
+				(await handleSearchIntelligenceApiRequest(request(payload), client))
+					?.status
+			).toBe(400)
+		}
+		expect(posts).toHaveLength(0)
+		expect(
+			owner.database.query("SELECT count(*) AS count FROM keyValue").get()
+		).toEqual({ count: 0 })
+	})
+	it("serializes concurrent monthly deliveries and freezes the complete report before its first part", async () => {
+		const { client, posts } = setup()
+		const original = client.rest.post.bind(client.rest)
+		let release!: () => void
+		let entered!: () => void
+		const ready = new Promise<void>((resolve) => {
+			entered = resolve
+		})
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		client.rest.post = (async (...args: Parameters<typeof original>) => {
+			entered()
+			await gate
+			return original(...args)
+		}) as typeof client.rest.post
+		const payload = monthlyPayload(true)
+		const first = handleSearchIntelligenceApiRequest(request(payload), client)
+		await ready
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(409)
+		const changed = monthlyPayload(true)
+		changed.catalogs.skills.recommendations[15].reason = "Changed final item"
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(changed), client))
+				?.status
+		).toBe(409)
+		release()
+		expect((await first)?.status).toBe(200)
+		const nonces = posts.map(({ body }) => body.nonce)
+		expect(new Set(nonces).size).toBe(nonces.length)
+		expect(nonces.length).toBeGreaterThan(1)
+	})
+	it("retries only a rejected monthly part and never reposts confirmed earlier parts", async () => {
+		const { client, posts } = setup()
+		const original = client.rest.post.bind(client.rest)
+		let calls = 0
+		client.rest.post = (async (...args: Parameters<typeof original>) => {
+			if (++calls === 2)
+				throw Object.assign(new Error("Rejected"), { status: 429 })
+			return original(...args)
+		}) as typeof client.rest.post
+		const payload = monthlyPayload(true)
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(502)
+		expect(posts).toHaveLength(1)
+		const firstNonce = posts[0].body.nonce
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		expect(posts.filter(({ body }) => body.nonce === firstNonce)).toHaveLength(
+			1
+		)
+		expect(posts.flatMap(({ body }) => texts(body)).join("\n")).toContain(
+			payload.catalogs.skills.recommendations[15].id
+		)
+	})
+	it("reconciles an uncertain middle monthly part before continuing the same report", async () => {
+		const { client, posts } = setup()
+		const original = client.rest.post.bind(client.rest)
+		let calls = 0
+		client.rest.post = (async (...args: Parameters<typeof original>) => {
+			const result = await original(...args)
+			if (++calls === 2) throw new Error("Response lost")
+			return result
+		}) as typeof client.rest.post
+		const payload = monthlyPayload(true)
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(503)
+		expect(posts).toHaveLength(2)
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(503)
+		expect(posts).toHaveLength(2)
+		client.rest.get = async () =>
+			[
+				{
+					id: "confirmed-part-2",
+					author: { id: "bot-user", bot: true },
+					timestamp: new Date().toISOString(),
+					components: posts[1].body.components
+				}
+			] as never
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		expect(posts.length).toBeGreaterThan(2)
+		expect(new Set(posts.map(({ body }) => body.nonce)).size).toBe(posts.length)
+	})
+	it("recovers a final monthly receipt write failure without repeating its confirmed parts", async () => {
+		const { client, posts, owner } = setup()
+		owner.database.exec(`CREATE TRIGGER fail_monthly_completion BEFORE UPDATE ON keyValue
+			WHEN json_extract(NEW.value, '$.version') = 2 AND json_extract(NEW.value, '$.status') = 'sent'
+			BEGIN SELECT RAISE(ABORT, 'fixture receipt unavailable'); END`)
+		const payload = monthlyPayload(true)
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(503)
+		const count = posts.length
+		expect(count).toBeGreaterThan(1)
+		owner.database.exec("DROP TRIGGER fail_monthly_completion")
+		expect(
+			(await handleSearchIntelligenceApiRequest(request(payload), client))
+				?.status
+		).toBe(200)
+		expect(posts).toHaveLength(count)
+		const receipts = owner.database
+			.query("SELECT value FROM keyValue")
+			.all() as { value: string }[]
+		expect(
+			receipts.every(({ value }) => JSON.parse(value).status === "sent")
+		).toBe(true)
+		expect(
+			receipts.some(({ value }) =>
+				value.includes(payload.catalogs.skills.recommendations[0].id)
+			)
+		).toBe(false)
+	})
+
+	it("preserves a sent v3 week when a monthly replacement arrives", async () => {
+		const { client, posts } = setup()
+		expect(
+			(
+				await handleSearchIntelligenceApiRequest(
+					request(lineupPayload()),
+					client
+				)
+			)?.status
+		).toBe(200)
+		expect(
+			(
+				await handleSearchIntelligenceApiRequest(
+					request(monthlyPayload()),
+					client
+				)
+			)?.status
+		).toBe(409)
+		expect(posts).toHaveLength(1)
+	})
+
 	it("delivers and replays the complete eight-per-catalog lineup without dropping long links", async () => {
 		const { client, posts } = setup()
 		const payload = lineupPayload()
@@ -449,7 +895,8 @@ describe("ClawHub weekly search intelligence receiver", () => {
 				Object.assign(payload.catalogs.skills.lineup, { userId: "private" })
 			},
 			(payload) => {
-				payload.catalogs.plugins.recommendations[1].search!.queries[0].searches7d = 2
+				payload.catalogs.plugins.recommendations[1]
+					.search!.queries[0].searches7d = 2
 			},
 			(payload) => {
 				payload.catalogs.skills.recommendations[2].support = "current-only"
