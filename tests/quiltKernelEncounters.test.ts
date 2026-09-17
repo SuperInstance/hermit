@@ -27,7 +27,7 @@ import { SqliteD1Database } from "./helpers/sqliteD1.js"
 // and never see 0013 — unchanged suites stay honest.
 const migrationPaths = readdirSync("drizzle")
 	.filter((file) =>
-		/0002_.*\.sql|000[4-9]_.*\.sql|001[013]_.*\.sql/.test(file)
+		/0002_.*\.sql|000[4-9]_.*\.sql|001[0134]_.*\.sql/.test(file)
 	)
 	.sort()
 
