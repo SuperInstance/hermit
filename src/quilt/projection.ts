@@ -35,50 +35,19 @@ export type WalRow = {
 	hash: string
 }
 
-export type VoteProjectionInput = {
-	nominationId: number
-	reviewerId: string
-	choice: "approve" | "decline"
-	resultKind:
-		| "recorded"
-		| "switched"
-		| "granting"
-		| "declined"
-		| "expired"
-	status: string
-	totals: { approvals: number; declines: number }
-	completedAt: string | null
-	mutationId: string
-	ts: string
-}
-
 export type KernelLike = {
 	bind(name: string, value?: unknown, meta?: unknown): unknown
 	link(from: string, to: string, type: string): string
 	unsubscribe?: () => void
 }
 
-// Mirror one recordNominationVote transition into kernel ops. Every write
-// is a BIND; the voter's cell LINKs to the nomination cell ('cast').
-export const projectNominationVote = (
-	kernel: KernelLike,
-	input: VoteProjectionInput
-): void => {
-	const base = `nomination.${input.nominationId}`
-	// the nomination itself is a cell — link endpoints must exist (L1 law)
-	kernel.bind(base, { id: input.nominationId, kind: "nomination" })
-	kernel.bind(`${base}.mutation`, input.mutationId, { ts: input.ts })
-	kernel.bind(`${base}.status`, input.status)
-	kernel.bind(`${base}.totals`, input.totals)
-	kernel.bind(`${base}.completedAt`, input.completedAt)
-	if (input.resultKind !== "expired") {
-		const voteCell = `${base}.vote.${input.reviewerId}`
-		kernel.bind(voteCell, input.choice, { ts: input.ts })
-		kernel.link(voteCell, base, "cast")
-	}
-}
-
-// Turn drained kernel events into hash-chained WAL rows, continuing the
+// THREAT MODEL (review finding #8): the chain is FNV-1a, unkeyed, 32-bit.
+// It proves CONTINUITY (no row altered, none missing, in sequence order),
+// not tamper-evidence against a writer with table access — anyone who can
+// update quilt_wal can recompute a valid suffix. Upgrade path: swap fnv1a
+// for sha256 over the same input string; verifyChain's row format is
+// hash-function-agnostic. Do not cite the WAL in audit context until the
+// sha256 upgrade lands.// Turn drained kernel events into hash-chained WAL rows, continuing the
 // chain from `tip` (0 for genesis) and `prevHash`.
 export const buildWalRows = (
 	events: Array<{ kind: string; cell: string | null; value: unknown }>,
@@ -162,9 +131,20 @@ export const replayNominationFromWal = (
 	nominationId: number
 ): ReplayedNomination | null => {
 	const prefix = `nomination.${nominationId}.`
+	const base = `nomination.${nominationId}`
 	const cells = new Map<string, unknown>()
-	for (const row of rows) {
-		if (row.op !== "bind" || !row.cell.startsWith(prefix)) continue
+	// findings #3/#7: never trust caller row order; honor unbinds. copy +
+	// sort so `seq desc` input replays identically to `seq asc`.
+	const ordered = [...rows].sort((a, b) => a.seq - b.seq)
+	for (const row of ordered) {
+		// the bare entity bind IS the entity marker; sub-cells carry
+		// the properties. both belong in the map.
+		if (row.cell !== base && !row.cell.startsWith(prefix)) continue
+		if (row.op === "unbind") {
+			cells.delete(row.cell)
+			continue
+		}
+		if (row.op !== "bind") continue
 		cells.set(row.cell, row.value === null ? null : JSON.parse(row.value))
 	}
 	if (cells.size === 0) return null
@@ -324,37 +304,54 @@ export const analyzeRefusals = (
 	rows: WalRow[],
 	guildId?: string
 ): RefusalRecord[] => {
+	// finding #4: suffix-strip the interactionId (cell shape is exactly
+	// `encounter.<ix>.refused`, and <ix> may itself contain dots), index
+	// attempts in one pass instead of O(n²) finds, and never let one bad
+	// row kill the whole analysis.
+	const ATTEMPT_PREFIX = "encounter."
+	const REFUSED_SUFFIX = ".refused"
+	const parse = (raw: string | null | undefined): Record<string, unknown> => {
+		if (!raw) return {}
+		try {
+			return JSON.parse(raw) as Record<string, unknown>
+		} catch {
+			return {}
+		}
+	}
+	const attempts = new Map<string, Record<string, unknown>>()
+	for (const row of rows) {
+		if (row.op !== "bind") continue
+		// index EVERY bind cell by exact key — the attempt cell for a
+		// refusal is `encounter.<ix>` constructed exactly, so dotted
+		// interaction ids can never collide with sub-cells.
+		if (!attempts.has(row.cell)) {
+			attempts.set(row.cell, parse(row.value))
+		}
+	}
+
 	const records: RefusalRecord[] = []
 	for (const row of rows) {
-		if (row.op !== "bind" || !row.cell.endsWith(".refused")) continue
-		const payload = JSON.parse(row.value ?? "{}") as {
-			refusedBy?: string[]
-			remaining?: Array<{ kind: string; remainingSeconds: number }>
-			ts?: string
-		}
-		const parts = row.cell.split(".")
-		const interactionId = parts[1]
-		const attemptRow = rows.find(
-			(candidate) =>
-				candidate.op === "bind" &&
-				candidate.cell === `encounter.${interactionId}` &&
-				candidate.seq < row.seq
+		if (row.op !== "bind" || !row.cell.endsWith(REFUSED_SUFFIX)) continue
+		const interactionId = row.cell.slice(
+			ATTEMPT_PREFIX.length,
+			row.cell.length - REFUSED_SUFFIX.length
 		)
-		const attempt = JSON.parse(attemptRow?.value ?? "{}") as {
-			guildId?: string
-			channelId?: string
-			actorId?: string
-			targetId?: string
-		}
+		const payload = parse(row.value)
+		const attempt = attempts.get(`${ATTEMPT_PREFIX}${interactionId}`) ?? {}
 		if (guildId && attempt.guildId !== guildId) continue
 		records.push({
 			interactionId,
-			actorId: attempt.actorId ?? "",
-			targetId: attempt.targetId ?? "",
-			channelId: attempt.channelId ?? "",
-			refusedBy: payload.refusedBy ?? [],
-			remaining: payload.remaining ?? [],
-			ts: payload.ts ?? row.ts
+			actorId: typeof attempt.actorId === "string" ? attempt.actorId : "",
+			targetId: typeof attempt.targetId === "string" ? attempt.targetId : "",
+			channelId:
+				typeof attempt.channelId === "string" ? attempt.channelId : "",
+			refusedBy: Array.isArray(payload.refusedBy)
+				? (payload.refusedBy as string[])
+				: [],
+			remaining: Array.isArray(payload.remaining)
+				? (payload.remaining as RefusalRecord["remaining"])
+				: [],
+			ts: typeof payload.ts === "string" ? payload.ts : row.ts
 		})
 	}
 	return records
@@ -378,9 +375,18 @@ export const replayEncounterFromWal = (
 	encounterId: number
 ): ReplayedEncounter | null => {
 	const prefix = `encounter.${encounterId}.`
+	const base = `encounter.${encounterId}`
 	const cells = new Map<string, unknown>()
-	for (const row of rows) {
-		if (row.op !== "bind" || !row.cell.startsWith(prefix)) continue
+	// findings #3/#7: sort by seq internally; unbind deletes the cell; the
+	// bare entity bind is the entity marker and counts.
+	const ordered = [...rows].sort((a, b) => a.seq - b.seq)
+	for (const row of ordered) {
+		if (row.cell !== base && !row.cell.startsWith(prefix)) continue
+		if (row.op === "unbind") {
+			cells.delete(row.cell)
+			continue
+		}
+		if (row.op !== "bind") continue
 		cells.set(row.cell, row.value === null ? null : JSON.parse(row.value))
 	}
 	if (cells.size === 0) return null
