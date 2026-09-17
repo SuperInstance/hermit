@@ -129,16 +129,22 @@ export const buildWalRows = (
 	return rows
 }
 
-export const verifyChain = (rows: WalRow[]): boolean => {
+export type ChainVerification =
+	| { ok: true }
+	| { ok: false; firstBadSeq: number | null }
+
+export const verifyChain = (rows: WalRow[]): ChainVerification => {
 	let prevHash = GENESIS
 	for (const row of rows) {
 		const expected = fnv1a(
 			`${prevHash}|${row.seq}|${row.cell}|${row.op}|${row.value ?? ""}|${row.ts}|${row.mutation_id}`
 		)
-		if (row.prev_hash !== prevHash || row.hash !== expected) return false
+		if (row.prev_hash !== prevHash || row.hash !== expected) {
+			return { ok: false, firstBadSeq: row.seq }
+		}
 		prevHash = row.hash
 	}
-	return true
+	return { ok: true }
 }
 
 // Replay the WAL for ONE nomination back into review-state shape, to diff
