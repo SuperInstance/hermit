@@ -1,3 +1,4 @@
+import { commitNominationVoteProjection } from "../quilt/commit.js"
 import {
 	and,
 	asc,
@@ -225,6 +226,30 @@ export const getActiveNominationForNominee = async (
 	return nomination ?? null
 }
 
+// Dual-write the transition into the quilt kernel's WAL. Failure is
+// logged, never thrown — the projection is a mirror, not the source of
+// truth (P1 posture).
+const projectVoteToKernel = async (
+	database: NominationDatabase,
+	input: {
+		nominationId: number
+		reviewerId: string
+		choice: NominationVoteChoice
+		resultKind: "recorded" | "switched" | "granting" | "declined" | "expired"
+		status: string
+		totals: NominationVoteTotals
+		completedAt: string | null
+		mutationId: string
+		ts: string
+	}
+): Promise<void> => {
+	try {
+		await commitNominationVoteProjection(database.$client, input)
+	} catch (error) {
+		console.warn("quilt wal projection failed", error)
+	}
+}
+
 export const recordNominationVote = async (
 	nominationId: number,
 	reviewerId: string,
@@ -374,12 +399,24 @@ export const recordNominationVote = async (
 	const voteChanged = (results[2]?.results.length ?? 0) > 0
 
 	if (expiredByThisMutation) {
-		return {
+		const result: NominationVoteResult = {
 			kind: "expired",
 			nomination,
 			totals,
 			previousChoice
 		}
+		await projectVoteToKernel(database, {
+			nominationId,
+			reviewerId,
+			choice,
+			resultKind: "expired",
+			status: nomination.status,
+			totals,
+			completedAt: nomination.completedAt,
+			mutationId,
+			ts: transitionTime
+		})
+		return result
 	}
 
 	if (!voteChanged) {
@@ -394,19 +431,32 @@ export const recordNominationVote = async (
 		}
 	}
 
-	return {
-		kind:
-			nomination.status === "granting"
-				? "granting"
-				: nomination.status === "declined"
-					? "declined"
-					: previousChoice
-						? "switched"
-						: "recorded",
+	const resultKind =
+		nomination.status === "granting"
+			? "granting"
+			: nomination.status === "declined"
+				? "declined"
+				: previousChoice
+					? "switched"
+					: "recorded"
+	const result: NominationVoteResult = {
+		kind: resultKind,
 		nomination,
 		totals,
 		previousChoice
 	}
+	await projectVoteToKernel(database, {
+		nominationId,
+		reviewerId,
+		choice,
+		resultKind,
+		status: nomination.status,
+		totals,
+		completedAt: nomination.completedAt,
+		mutationId,
+		ts: transitionTime
+	})
+	return result
 }
 
 export const markNominationApproved = async (
