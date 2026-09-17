@@ -473,3 +473,19 @@ export type ActionCooldownEvent = typeof actionCooldownEvents.$inferSelect
 export type NewActionCooldownEvent = typeof actionCooldownEvents.$inferInsert
 export type LobsterEncounter = typeof lobsterEncounters.$inferSelect
 export type NewLobsterEncounter = typeof lobsterEncounters.$inferInsert
+
+export const quiltWal = sqliteTable(
+	"quilt_wal",
+	{
+		seq: integer().primaryKey({ autoIncrement: true }),
+		mutationId: text("mutation_id").notNull(),
+		ts: text().notNull(),
+		cell: text().notNull(),
+		op: text().notNull(),
+		value: text(),
+		prevHash: text("prev_hash").notNull(),
+		hash: text().notNull()
+	},
+	(table) => [index("quilt_wal_mutation_idx").on(table.mutationId)]
+)
+export type QuiltWalRow = typeof quiltWal.$inferSelect
