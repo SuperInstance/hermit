@@ -4,6 +4,13 @@ import {
 	lobsterEncounters,
 	type LobsterEncounter
 } from "../db/schema.js"
+import { commitProjection } from "../quilt/commit.js"
+import {
+	projectLobsterEncounter,
+	projectLobsterPublication,
+	projectLobsterResponse,
+	type EncounterProjectionInput
+} from "../quilt/projection.js"
 import {
 	actionCooldownExpiries,
 	readActionCooldowns,
@@ -85,6 +92,60 @@ const toJson = (value: unknown) => {
 		throw new Error("Encounter JSON fields must be serializable")
 	}
 	return serialized
+}
+
+// Dual-write the outcome into the quilt kernel's WAL. Failure is logged,
+// never thrown — the projection is a mirror (P2 posture, same as P1).
+// The negative ledger lives here: cooldown refusals get first-class rows.
+const projectEncounterSafely = async (
+	database: LobsterDatabase,
+	input: CreateLobsterEncounterInput,
+	outcome: CreateLobsterEncounterResult,
+	ts: string
+): Promise<void> => {
+	try {
+		const attempt = {
+			guildId: input.guildId,
+			channelId: input.channelId,
+			actorId: input.actorId,
+			targetId: input.targetId
+		}
+		const projection: EncounterProjectionInput =
+			outcome.kind === "cooldown"
+				? {
+					resultKind: "cooldown",
+					interactionId: input.interactionId,
+					attempt,
+					refusedBy: outcome.cooldowns.map((cooldown) => cooldown.kind),
+					remaining: outcome.cooldowns,
+					ts
+				}
+				: outcome.kind === "created"
+					? {
+						resultKind: "created",
+						interactionId: input.interactionId,
+						attempt,
+						encounter: {
+							id: outcome.encounter.id,
+							speciesDisplayName: outcome.encounter.speciesDisplayName,
+							publicationStatus: outcome.encounter.publicationStatus
+						},
+						ts
+					}
+				: {
+					resultKind: outcome.kind,
+					interactionId: input.interactionId,
+					attempt,
+					ts
+				}
+		await commitProjection(
+			database.$client,
+			{ mutationId: input.interactionId, ts },
+			(kernel) => projectLobsterEncounter(kernel, projection)
+		)
+	} catch (error) {
+		console.warn("quilt wal encounter projection failed", error)
+	}
 }
 
 export const getLobsterEncounter = async (
@@ -334,42 +395,45 @@ export const createLobsterEncounter = async (
 	])
 
 	const existingId = Number(results[0]?.results[0]?.id)
+	let outcome: CreateLobsterEncounterResult
 	if (Number.isInteger(existingId) && existingId > 0) {
 		const encounter = await getLobsterEncounter(existingId, database)
 		if (!encounter) {
 			throw new Error(`Lobster encounter ${existingId} disappeared during retry`)
 		}
-		return existingResult(encounter)
-	}
-
-	const createdId = Number(results[3]?.results[0]?.id)
-	if (Number.isInteger(createdId) && createdId > 0) {
-		const encounter = await getLobsterEncounter(createdId, database)
-		if (!encounter) {
-			throw new Error(`Lobster encounter ${createdId} disappeared after creation`)
+		outcome = existingResult(encounter)
+	} else {
+		const createdId = Number(results[3]?.results[0]?.id)
+		if (Number.isInteger(createdId) && createdId > 0) {
+			const encounter = await getLobsterEncounter(createdId, database)
+			if (!encounter) {
+				throw new Error(`Lobster encounter ${createdId} disappeared after creation`)
+			}
+			outcome = { kind: "created", encounter }
+		} else {
+			const concurrentEncounter = await getLobsterEncounterByInteractionId(
+				input.interactionId,
+				database
+			)
+			if (concurrentEncounter) {
+				outcome = existingResult(concurrentEncounter)
+			} else {
+				const cooldowns = readActionCooldowns([
+					{ kind: "actor", expiresAt: results[4]?.results[0]?.actor_expires_at },
+					{ kind: "target", expiresAt: results[5]?.results[0]?.target_expires_at },
+					{ kind: "channel", expiresAt: results[6]?.results[0]?.channel_expires_at }
+				], referenceDate)
+				if (cooldowns.length === 0) {
+					throw new Error(
+						"Lobster encounter was neither created nor blocked by a cooldown"
+					)
+				}
+				outcome = { kind: "cooldown", cooldowns }
+			}
 		}
-		return { kind: "created", encounter }
 	}
-
-	const concurrentEncounter = await getLobsterEncounterByInteractionId(
-		input.interactionId,
-		database
-	)
-	if (concurrentEncounter) {
-		return existingResult(concurrentEncounter)
-	}
-
-	const cooldowns = readActionCooldowns([
-		{ kind: "actor", expiresAt: results[4]?.results[0]?.actor_expires_at },
-		{ kind: "target", expiresAt: results[5]?.results[0]?.target_expires_at },
-		{ kind: "channel", expiresAt: results[6]?.results[0]?.channel_expires_at }
-	], referenceDate)
-	if (cooldowns.length === 0) {
-		throw new Error(
-			"Lobster encounter was neither created nor blocked by a cooldown"
-		)
-	}
-	return { kind: "cooldown", cooldowns }
+	await projectEncounterSafely(database, input, outcome, timestamp)
+	return outcome
 }
 
 export const bindLobsterMessage = async (
@@ -434,15 +498,30 @@ export const bindLobsterMessage = async (
 	) {
 		return { kind: "conflict", encounter }
 	}
-	return {
-		kind:
-			previous.message_id === messageId
-				? "already_bound"
-				: results[1]?.results[0]
-					? "bound"
-					: "conflict",
-		encounter
+	const kind =
+		previous.message_id === messageId
+			? "already_bound"
+			: results[1]?.results[0]
+				? "bound"
+				: "conflict"
+	if (kind === "bound") {
+		try {
+			await commitProjection(
+				database.$client,
+				{ mutationId: `bind:${encounterId}:${messageId}`, ts: timestamp },
+				(kernel) =>
+					projectLobsterPublication(kernel, {
+						encounterId,
+						kind: "bound",
+						messageId,
+						ts: timestamp
+					})
+			)
+		} catch (error) {
+			console.warn("quilt wal bind projection failed", error)
+		}
 	}
+	return { kind, encounter }
 }
 
 export const markLobsterPublicationFailed = async (
@@ -489,6 +568,21 @@ export const markLobsterPublicationFailed = async (
 		return { kind: "not_found" }
 	}
 	if (results[0]?.results[0]) {
+		try {
+			await commitProjection(
+				database.$client,
+				{ mutationId: `pubfail:${encounter.interactionId}`, ts: timestamp },
+				(kernel) =>
+					projectLobsterPublication(kernel, {
+						encounterId,
+						kind: "publication_failed",
+						failure,
+						ts: timestamp
+					})
+			)
+		} catch (error) {
+			console.warn("quilt wal publication projection failed", error)
+		}
 		return { kind: "marked_failed", encounter }
 	}
 	return {
@@ -578,8 +672,23 @@ export const recordLobsterResponse = async (
 	if (!authorized) {
 		return { kind: "unauthorized", encounter }
 	}
-	return {
-		kind: updateResult?.results[0] ? "recorded" : "already_recorded",
-		encounter
+	const kind = updateResult?.results[0] ? "recorded" : "already_recorded"
+	if (kind === "recorded") {
+		try {
+			await commitProjection(
+				database.$client,
+				{ mutationId: `response:${encounter.interactionId}`, ts: timestamp },
+				(kernel) =>
+					projectLobsterResponse(kernel, {
+						encounterId: input.encounterId,
+						responseType: input.responseType,
+						responderId: input.responderId,
+						ts: timestamp
+					})
+			)
+		} catch (error) {
+			console.warn("quilt wal response projection failed", error)
+		}
 	}
+	return { kind, encounter }
 }

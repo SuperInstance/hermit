@@ -1,13 +1,11 @@
-// commit.ts — dual-write one vote transition into the quilt WAL.
+// commit.ts — dual-write state transitions into the quilt WAL.
 import { QuiltKernel, type QuiltEvent } from "./reference-kernel.mjs"
 import {
 	buildWalRows,
-	projectNominationVote,
-	type VoteProjectionInput,
 	type WalRow
 } from "./projection.js"
 
-type WalClient = {
+export type WalClient = {
 	batch<T = Record<string, unknown>>(
 		statements: unknown[]
 	): Promise<Array<{ results: T[] }>>
@@ -18,19 +16,24 @@ type WalClient = {
 
 export type ChainTip = { tip: number; prev: string | null }
 
-// Project a vote into kernel ops and append the hash-chained WAL rows in
-// ONE batch. Returns the number of rows committed. Throws only on D1
-// failure — callers in the vote path catch and log (dual-write posture).
-export const commitNominationVoteProjection = async (
+export type CommitContext = {
+	mutationId: string
+	ts: string
+}
+
+// Generic projector: run `project` against a fresh kernel, drain the
+// events, append hash-chained WAL rows in ONE batch. Returns rows written.
+export const commitProjection = async (
 	client: WalClient,
-	input: VoteProjectionInput
+	context: CommitContext,
+	project: (kernel: QuiltKernel) => void
 ): Promise<number> => {
 	const kernel = new QuiltKernel()
 	const events: QuiltEvent[] = []
 	const unsubscribe = kernel.subscribe((event) => {
 		events.push(event)
 	})
-	projectNominationVote(kernel, input)
+	project(kernel)
 	unsubscribe()
 
 	const [tipResult] = await client.batch<ChainTip>([
@@ -42,8 +45,8 @@ export const commitNominationVoteProjection = async (
 	])
 	const tipRow = tipResult?.results?.[0] ?? { tip: 0, prev: null }
 	const rows = buildWalRows(events, {
-		mutationId: input.mutationId,
-		ts: input.ts,
+		mutationId: context.mutationId,
+		ts: context.ts,
 		tip: Number(tipRow.tip ?? 0),
 		prevHash: tipRow.prev ?? null
 	})
@@ -70,3 +73,38 @@ export const commitNominationVoteProjection = async (
 	)
 	return rows.length
 }
+
+// P1 entry point — kept for src/data/nominations.ts.
+export const commitNominationVoteProjection = (
+	client: WalClient,
+	input: {
+		nominationId: number
+		reviewerId: string
+		choice: "approve" | "decline"
+		resultKind:
+			| "recorded"
+			| "switched"
+			| "granting"
+			| "declined"
+			| "expired"
+		status: string
+		totals: { approvals: number; declines: number }
+		completedAt: string | null
+		mutationId: string
+		ts: string
+	}
+): Promise<number> =>
+	commitProjection(client, { mutationId: input.mutationId, ts: input.ts }, (kernel) => {
+		const base = `nomination.${input.nominationId}`
+		// the nomination itself is a cell — link endpoints must exist (L1 law)
+		kernel.bind(base, { id: input.nominationId, kind: "nomination" })
+		kernel.bind(`${base}.mutation`, input.mutationId, { ts: input.ts })
+		kernel.bind(`${base}.status`, input.status)
+		kernel.bind(`${base}.totals`, input.totals)
+		kernel.bind(`${base}.completedAt`, input.completedAt)
+		if (input.resultKind !== "expired") {
+			const voteCell = `${base}.vote.${input.reviewerId}`
+			kernel.bind(voteCell, input.choice, { ts: input.ts })
+			kernel.link(voteCell, base, "cast")
+		}
+	})
