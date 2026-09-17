@@ -1,4 +1,5 @@
 import { commitNominationVoteProjection } from "../quilt/commit.js"
+import { recordWalFailure } from "../quilt/ops.js"
 import {
 	and,
 	asc,
@@ -246,7 +247,7 @@ const projectVoteToKernel = async (
 	try {
 		await commitNominationVoteProjection(database.$client, input)
 	} catch (error) {
-		console.warn("quilt wal projection failed", error)
+		recordWalFailure("nomination_projection", error)
 	}
 }
 

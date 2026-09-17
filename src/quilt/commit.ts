@@ -14,6 +14,7 @@ import {
 	buildWalRows,
 	type WalRow
 } from "./projection.js"
+import { recordWalCommit, recordWalFailure } from "./ops.js"
 
 export type WalClient = {
 	batch<T = Record<string, unknown>>(
@@ -97,9 +98,9 @@ export const commitProjection = async (
 	const holder = nextHolder(context.mutationId)
 	const acquired = await claimWalLock(client, holder, new Date())
 	if (!acquired) {
-		console.warn(
-			"quilt wal lock not acquired; projection skipped",
-			context.mutationId
+		recordWalFailure(
+			"lock_exhausted",
+			new Error(`projection skipped for ${context.mutationId}`)
 		)
 		return 0
 	}
@@ -129,6 +130,7 @@ export const commitProjection = async (
 		})
 		if (rows.length === 0) return 0
 
+		recordWalCommit(rows.length)
 		await client.batch(
 			rows.map((row: WalRow) =>
 				client
