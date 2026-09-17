@@ -500,3 +500,47 @@ export const quiltWalLock = sqliteTable("quilt_wal_lock", {
 	holder: text().notNull(),
 	acquiredAt: text("acquired_at").notNull()
 })
+
+// tidepool v1: helper-thread memory ocean. Per the contract the WAL is the
+// source of truth — these tables are the materialized view for live reads;
+// replay from WAL rebuilds the recall index bit-for-bit.
+export const helperThreads = sqliteTable(
+	"helper_threads",
+	{
+		id: text().primaryKey(), // discord thread id
+		guildId: text("guild_id").notNull(),
+		channelId: text("channel_id").notNull(),
+		userId: text("user_id").notNull(),
+		helperKey: text("helper_key").notNull(),
+		helperName: text("helper_name").notNull(),
+		questionText: text("question_text").notNull(),
+		responseText: text("response_text").notNull(),
+		thinkingLevel: text("thinking_level").notNull(),
+		responseLength: integer("response_length").notNull(),
+		createdAt: text("created_at").notNull(),
+		authorTag: text("author_tag").notNull(),
+		authorUsername: text("author_username").notNull(),
+		lastMessageId: text("last_message_id")
+	},
+	(table) => [
+		index("helper_threads_channel_idx").on(table.channelId),
+		index("helper_threads_guild_idx").on(table.guildId)
+	]
+)
+export type HelperThread = typeof helperThreads.$inferSelect
+export type NewHelperThread = typeof helperThreads.$inferInsert
+
+// Raw message log per thread (JSON string), append-only.
+export const helperLogs = sqliteTable(
+	"helper_logs",
+	{
+		guildId: text("guild_id").notNull(),
+		channelId: text("channel_id").notNull(),
+		threadId: text("thread_id").notNull().primaryKey(),
+		messages: text().notNull(), // JSON string, append-only
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull()
+	}
+)
+export type HelperLog = typeof helperLogs.$inferSelect
+export type NewHelperLog = typeof helperLogs.$inferInsert
