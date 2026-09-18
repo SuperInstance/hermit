@@ -6,7 +6,7 @@ state: active
 family: applications
 vessel: CCC
 born_from: []
-feeds: [tidepool]
+feeds: [tidepool, duke-lab]
 owed_by: []
 canonical_docs: [README.md, drizzle/0013_quilt_kernel_wal.sql, src/quilt/commit.ts]
 ledger: quilt-wal
