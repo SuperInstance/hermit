@@ -486,6 +486,13 @@ export const quiltWal = sqliteTable(
 		prevHash: text("prev_hash").notNull(),
 		hash: text().notNull()
 	},
-	(table) => [index("quilt_wal_mutation_idx").on(table.mutationId)]
+	(table) => [
+		index("quilt_wal_mutation_idx").on(table.mutationId),
+		// Lane D: each row claims exactly one parent — the DB refuses a
+		// second row chaining to the same prev_hash, which is what turns
+		// the commit tip-race from a silent hash-chain fork into a
+		// catchable conflict the committer can retry against.
+		uniqueIndex("quilt_wal_prev_hash_uidx").on(table.prevHash)
+	]
 )
 export type QuiltWalRow = typeof quiltWal.$inferSelect
