@@ -13,6 +13,9 @@
 // fnv1a — same algorithm the fleet's own rate limiter uses (tidepool).
 // This is an INTEGRITY chain (detect gaps/tampering), not a security
 // signature; P2 can upgrade to sha256 via crypto.subtle.
+// The honest, complete deviation record vs the fleet's paper-110 spec —
+// and the upgrade path — lives in docs/QUILT_WAL_HASH.md. Keep that doc
+// and this constant in sync on any hash change.
 const fnv1a = (input: string): string => {
 	let hash = 0x811c9dc5
 	for (let index = 0; index < input.length; index += 1) {
@@ -21,6 +24,11 @@ const fnv1a = (input: string): string => {
 	}
 	return hash.toString(16).padStart(8, "0")
 }
+
+// Single source of truth for which hash the chain rows carry. Pinned so
+// the spec amendment (docs/QUILT_WAL_HASH.md) is machine-checkable and a
+// future sha256 transition has exactly one switch to flip.
+export const WAL_HASH_ALGORITHM = "fnv1a-32" as const
 
 export const GENESIS = "GENESIS"
 
