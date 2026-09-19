@@ -22,7 +22,9 @@ import { SqliteD1Database } from "./helpers/sqliteD1.js"
 // Existing suites filter 000[4-9] and never see 0013 — unchanged suites
 // stay honest.
 const migrationPaths = readdirSync("drizzle")
-	.filter((file) => /0002_.*\.sql|000[4-9]_.*\.sql|0013_.*\.sql/.test(file))
+	.filter((file) =>
+		/0002_.*\.sql|000[4-9]_.*\.sql|001[34]_.*\.sql/.test(file)
+	)
 	.sort()
 
 const applyMigrations = (database: Database) => {
