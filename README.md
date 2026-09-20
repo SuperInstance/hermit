@@ -2,6 +2,10 @@
 
 Discord bot built with Carbon on Cloudflare Workers.
 
+## Vision
+
+Hermit is the fleet's durable companion: a Discord bot whose memory is a ledger, not a cache. Every vote cast, encounter run, helper thread answered, and cooldown refused is projected as BIND/LINK/EFFECT/VIEW/TICK events into a write-ahead log in D1 — hash-chained, replayable after any restart or deploy. When hermit wakes on a fresh isolate it does not remember because something was kept warm; it reconstructs its state by replaying the kernel. That is the fleet's quilt doctrine applied to a bot: the trace outlives the process. If a conversation mattered, it left rows; if it left rows, it can be audited, reconciled, and fed forward into the canon. Nothing hermit says about its own history is a recollection — it is a replay.
+
 ## Stack
 
 - `@buape/carbon`
@@ -70,6 +74,71 @@ The HTML index at `/` remains public and contains only endpoint links and filter
 Configure forms in `forms.config.ts`. `reviewRoleId` controls who can accept or deny submissions; optional `reviewPingRoleId` selects the role notified on new submissions and defaults to `reviewRoleId`.
 
 Discord, GitHub, and Reddit appeals plus moderator reports notify `1546936406272778271`, while Community Team (`1477360613125787678`) retains review access. ClawHub notifications and review access use `1509967254870298794`.
+
+## Hermit in the SuperInstance Fleet
+
+Hermit is one node in the [SuperInstance](https://github.com/SuperInstance) fleet. The sections below map how it plugs into the fleet's shared doctrine and instruments.
+
+### The paradigm map
+
+**Quilt — the memory spine.** Hermit's durable memory is the fleet's 5-opcode kernel: `BIND / LINK / EFFECT / VIEW / TICK` ([`src/quilt/reference-kernel.mjs`](src/quilt/reference-kernel.mjs), CONTRACT v5). Domain events — nomination votes, lobster encounters, cooldown refusals, helper threads, responses, publications — are projected into kernel events and appended to the `quilt_wal` D1 table as a hash chain (fnv1a-32, [docs/QUILT_WAL_HASH.md](docs/QUILT_WAL_HASH.md); schema in `drizzle/0013`/`0014`). The WAL is the source of truth: `src/quilt/reconcile.ts` replays it to detect drift, `src/quilt/ops.ts` counts its failures, and `src/quilt/canon-ledger.ts` turns its commits into canon packets. Doctrine and reference implementation: [SuperInstance/quilt-studio](https://github.com/SuperInstance/quilt-studio).
+
+**Tidepool — the memory ocean.** [`src/tidepool/`](src/tidepool) is hermit's local tidepool client. Every helper-thread memory is a dual-write: the ocean markdown is the human-readable memory ([`src/tidepool/ocean.ts`](src/tidepool/ocean.ts)), and the same fact is projected BIND-for-BIND into the quilt WAL ([`src/tidepool/projection.ts`](src/tidepool/projection.ts)) so it can be replayed. Quiet threads are detected by [`src/tidepool/stall.ts`](src/tidepool/stall.ts) and projected as first-class ledger facts. The fleet's vector ocean — distilled artifacts recalled by any agent, embedded in Cloudflare Vectorize — lives at [SuperInstance/tidepool](https://github.com/SuperInstance/tidepool); hermit's projection into it is the open seam (see [docs/QUILT-ENHANCEMENT-AUDIT.md](docs/QUILT-ENHANCEMENT-AUDIT.md), F2).
+
+**Canon — the live claim ledger.** Hermit is a quilt-live-canon node. Its [`CANON.md`](CANON.md) front matter is the claim: what the repo owes (`owed_by`), which feeds it serves. [`src/quilt/canon-ledger.ts`](src/quilt/canon-ledger.ts) parses the claim, replays the git log over the claim's scope (the kernel under `src/quilt/` plus every canonical doc), tags each packet with the claim field it serves, and fails the replay if a canonical doc is removed or the claim drops a feed while kernel commits still exist. The fleet CLI is [SuperInstance/quilt-canon-cli](https://github.com/SuperInstance/quilt-canon-cli) (`canon claim`, `canon drill`, `canon hash`, `canon graph`, `canon paper`).
+
+**The instruments — measured, never asserted.** Three fleet repos supply the measurement grammar hermit's cadences should speak. [SuperInstance/twist-engine](https://github.com/SuperInstance/twist-engine) demonstrates the law across five substrates: a deliberate twist between identical layers, with registration R(θ) measured by gaussian alignment (σ-shear, σ = 0.24·s) and the commensuration comb of small-denominator windows — the quantity is computed, never asserted. [SuperInstance/gesture-kit](https://github.com/SuperInstance/gesture-kit) reads a path's geometry order by order: arc length and heading (1st), bending energy (2nd), and torsion (3rd) — turning out of the plane. Terminology law: a *twist* is the deliberate offset itself; *torsion* is the third-order measure of a path leaving its plane. Different words, different orders. And `commensurate.mjs` ([SuperInstance/quilt-studio](https://github.com/SuperInstance/quilt-studio), `packages/quilt-floor/src/commensurate.mjs`) does exact rational arithmetic — f64 bits to BigInt rationals, Stern–Brocot search, nearest small-denominator rational — so "is this measured ratio commensurate?" has an exact answer.
+
+**duke-lab / q16 — the strain ruler.** [SuperInstance/duke-lab](https://github.com/SuperInstance/duke-lab) is a GAN with words: a generator plays takes, a critic scores them on a sixteen-feature ruler, and σ shrinks along a golden-section grid until the critic can no longer tell. The q16 strain doctrine generalizes: tune parameters against a measured ruler instead of asserting they work. Hermit's analog is its cadence surface — cooldown windows, stall-detector polls, expiry intervals — tuned against the refusal and quiet-thread topology the WAL already records.
+
+### Architecture
+
+```
+Discord events (forwarder/ Bun process)
+        |
+        v
++---------------------------------+
+| Carbon commands & services      |  src/commands/ · src/services/
++---------------+-----------------+
+                | domain events (vote · encounter · refusal · reply · thread)
+                v
++---------------------------------+      +------------------------------+
+| quilt kernel — 5 opcodes        |      | D1 quilt_wal (drizzle)       |
+| BIND · LINK · EFFECT · VIEW ·   |----->| fnv1a-32 hash chain          |
+| TICK                            |append| + quilt_wal_lock (CAS guard) |
+| src/quilt/reference-kernel.mjs  |      | migrations 0013 / 0014       |
++---------------+-----------------+      +---------------+--------------+
+                | events                                 | replay
+                v                                        v
++---------------------------------+      +------------------------------+
+| projections                     |      | reconcileQuiltWal (drift)    |
+| votes · encounters · refusals · |      | ops counters                 |
+| threads · responses ·           |      | canon ledger packets         |
+| publications                    |      +------------------------------+
++-------+-----------------+-------+
+        |                 |
+        v                 v
++-------------+   +--------------------+
+| tidepool    |   | helper_threads     |
+| ocean.md    |   | (D1 view over the  |
+| (human mem) |   |  WAL projection)   |
++-------------+   +--------------------+
+```
+
+### Migration status — in flight
+
+As of 2026-09-20 there are **no open PRs**: the quilt migration has landed on `main`. The table records the landed phases in merge order, then what remains genuinely open. README describes `main` as shipped; where a listed item is broken or unwired, it says so.
+
+| Phase | PR / commit | What it landed | Status on `main` |
+|-------|-------------|----------------|------------------|
+| P1–P4 quilt kernel | #1, #9, #10, #11, #12 | 5-opcode WAL dual-write, encounter shadow + negative ledger, replay-verify reconciliation, D1 claim lock + CAS/retry hardening, honest hash amendment | **Landed** — but the P4 merge dropped `projectNominationVote` from `src/quilt/projection.ts`; see audit F1 |
+| P5 ops counters | aa0ebd6 (PR #5) | `recordWalFailure` / `recordWalCommit` / `reconcileTick` | **Landed** — `recordWalCommit` has no callers; `reconcileTick` is not wired into the Worker `scheduled()` handler |
+| P6 tidepool v1 | 64e6eaf (PR #6) | ocean + WAL projection + stall detector + `helper_threads` view | **Landed** — failure path uses a local counter; `"tidepool_projection"` is not yet in the ops `WalFailureKind` union |
+| P7 canon ledger | b84ec12, #13 | Layer H ledger + Layer C ACK in CANON.md | **Landed** |
+| sha256 witness upgrade | — | Algo-tagged SHA-256 rows verifying alongside fnv1a-32 history | **Todo** — [docs/QUILT_WAL_HASH.md](docs/QUILT_WAL_HASH.md); todo-marked test in `tests/quiltWalHash.test.ts` |
+| Fleet tidepool projection | — | Distill helper memories into the vector ocean ([SuperInstance/tidepool](https://github.com/SuperInstance/tidepool)) | **Not started** — audit F2 |
+
+Further seams and ranked builds: [docs/QUILT-ENHANCEMENT-AUDIT.md](docs/QUILT-ENHANCEMENT-AUDIT.md).
 
 ## Scripts
 
