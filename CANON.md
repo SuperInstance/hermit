@@ -7,7 +7,7 @@ family: applications
 vessel: CCC
 born_from: []
 feeds: [tidepool, duke-lab]
-owed_by: []
+owed_by: [quilt]
 canonical_docs: [README.md, drizzle/0013_quilt_kernel_wal.sql, src/quilt/commit.ts]
 ledger: quilt-wal
 verified: 2026-09-17
