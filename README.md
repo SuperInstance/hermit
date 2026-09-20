@@ -6,6 +6,8 @@ Discord bot built with Carbon on Cloudflare Workers.
 
 Hermit is the fleet's durable companion: a Discord bot whose memory is a ledger, not a cache. Every vote cast, encounter run, helper thread answered, and cooldown refused is projected as BIND/LINK/EFFECT/VIEW/TICK events into a write-ahead log in D1 — hash-chained, replayable after any restart or deploy. When hermit wakes on a fresh isolate it does not remember because something was kept warm; it reconstructs its state by replaying the kernel. That is the fleet's quilt doctrine applied to a bot: the trace outlives the process. If a conversation mattered, it left rows; if it left rows, it can be audited, reconciled, and fed forward into the canon. Nothing hermit says about its own history is a recollection — it is a replay.
 
+Where it is going: the body grows hands. [PR #14](https://github.com/SuperInstance/hermit/pull/14) (`docs/HARNESS-SYNERGY.md`, open) maps how pincher — the reflex shell — plugs in as hermit's spinal cord, and lever-runner — the trust compiler — as its hand, with every ability lifecycle beat (BIND/EFFECT/VIEW/TICK) appended to the same WAL that already records votes. See [Hermit in the SuperInstance Fleet](#hermit-in-the-superinstance-fleet) below.
+
 ## Stack
 
 - `@buape/carbon`
@@ -91,6 +93,8 @@ Hermit is one node in the [SuperInstance](https://github.com/SuperInstance) flee
 
 **duke-lab / q16 — the strain ruler.** [SuperInstance/duke-lab](https://github.com/SuperInstance/duke-lab) is a GAN with words: a generator plays takes, a critic scores them on a sixteen-feature ruler, and σ shrinks along a golden-section grid until the critic can no longer tell. The q16 strain doctrine generalizes: tune parameters against a measured ruler instead of asserting they work. Hermit's analog is its cadence surface — cooldown windows, stall-detector polls, expiry intervals — tuned against the refusal and quiet-thread topology the WAL already records.
 
+**Harness — the body grows hands.** [PR #14](https://github.com/SuperInstance/hermit/pull/14) (`docs/HARNESS-SYNERGY.md`, branch `harness-synergy`, open from the same `adae217` base) is the fleet's application-harness design: hermit stops being a bot with features and becomes a **body with reflexes and hands**. Pincher — the reflex shell, Teach→Match→Execute in <50 ms with no LLM and a veto guard — plugs in as the spinal cord. Lever-runner — the trust compiler, teach a shell command once and run it forever, three gates deep — plugs in as the hand. Every ability beat is a quilt op: BIND (registration, `.nail` manifest as payload), EFFECT (each fire/execution, fuel-metered by confidence or time/trust), VIEW (ability state rendered into Discord + `/api/events` + `/api/threads`), TICK (scheduled reconcile + health). Because abilities ride the existing `src/quilt/commit.ts` CAS-guarded writer, what the fleet's applications *do* becomes as hash-chained, fuel-metered, and replay-verifiable as what they *remember*. Pincher decides *that* you know how to respond; lever-runner decides *how* to safely do the pre-approved thing; hermit is the body that remembers everything either one does.
+
 ### Architecture
 
 ```
@@ -127,11 +131,11 @@ Discord events (forwarder/ Bun process)
 
 ### Migration status — in flight
 
-As of 2026-09-20 there are **no open PRs**: the quilt migration has landed on `main`. The table records the landed phases in merge order, then what remains genuinely open. README describes `main` as shipped; where a listed item is broken or unwired, it says so.
+Quilt PRs #1–#13 are **merged**; `main` @ `adae217` carries the full spine. The genuinely open work: [PR #14](https://github.com/SuperInstance/hermit/pull/14) (the harness design doc, docs-only) and the main-is-red finding below. The table records the landed phases in merge order, then what remains honestly open. README describes `main` as shipped; where a listed item is broken or unwired, it says so.
 
 | Phase | PR / commit | What it landed | Status on `main` |
 |-------|-------------|----------------|------------------|
-| P1–P4 quilt kernel | #1, #9, #10, #11, #12 | 5-opcode WAL dual-write, encounter shadow + negative ledger, replay-verify reconciliation, D1 claim lock + CAS/retry hardening, honest hash amendment | **Landed** — but the P4 merge dropped `projectNominationVote` from `src/quilt/projection.ts`; see audit F1 |
+| P1–P4 quilt kernel | #1, #9, #10, #11, #12 | 5-opcode WAL dual-write, encounter shadow + negative ledger, replay-verify reconciliation, D1 claim lock + CAS/retry hardening, honest hash amendment | **Landed — but main is red:** `src/quilt/projection.ts` at `adae217` does not export `projectNominationVote`/`VoteProjectionInput`, which `src/quilt/commit.ts:5-6` imports — `bun test` dies with `SyntaxError: Export named 'projectNominationVote' not found` in ~15 test files. Verified by local clone + test run (remote `raw.githubusercontent.com` cross-checked). Fix is one evening: see [docs/QUILT-ENHANCEMENT-AUDIT.md](docs/QUILT-ENHANCEMENT-AUDIT.md) F1 |
 | P5 ops counters | aa0ebd6 (PR #5) | `recordWalFailure` / `recordWalCommit` / `reconcileTick` | **Landed** — `recordWalCommit` has no callers; `reconcileTick` is not wired into the Worker `scheduled()` handler |
 | P6 tidepool v1 | 64e6eaf (PR #6) | ocean + WAL projection + stall detector + `helper_threads` view | **Landed** — failure path uses a local counter; `"tidepool_projection"` is not yet in the ops `WalFailureKind` union |
 | P7 canon ledger | b84ec12, #13 | Layer H ledger + Layer C ACK in CANON.md | **Landed** |
@@ -139,6 +143,19 @@ As of 2026-09-20 there are **no open PRs**: the quilt migration has landed on `m
 | Fleet tidepool projection | — | Distill helper memories into the vector ocean ([SuperInstance/tidepool](https://github.com/SuperInstance/tidepool)) | **Not started** — audit F2 |
 
 Further seams and ranked builds: [docs/QUILT-ENHANCEMENT-AUDIT.md](docs/QUILT-ENHANCEMENT-AUDIT.md).
+
+## Doc index
+
+| Doc | What it is |
+|-----|------------|
+| [docs/QUILT-ENHANCEMENT-AUDIT.md](docs/QUILT-ENHANCEMENT-AUDIT.md) | Top-5 quilt-powered enhancements beyond the merged spine — cited file:line, WHAT EXISTS / WHAT'S MISSING / SMALLEST BUILD (this branch) |
+| [docs/QUILT_LEDGER_FINDINGS.md](docs/QUILT_LEDGER_FINDINGS.md) | The adversarial-audit findings (tip race, spec drift) that forced PRs #9–#12's hardening |
+| [docs/QUILT_WAL_HASH.md](docs/QUILT_WAL_HASH.md) | The fnv1a-32 witness-chain spec + the honest sha256 amendment path |
+| [PR #14 — HARNESS-SYNERGY.md](https://github.com/SuperInstance/hermit/pull/14) | The harness design: hermit × pincher × lever-runner (open, docs-only) |
+| [docs/clawhub-search-intelligence.md](docs/clawhub-search-intelligence.md) | The ClawHub weekly search-intelligence receiver (`/api/clawhub-search-intelligence/weekly`) |
+| [docs/lobster-command-prd.md](docs/lobster-command-prd.md), [docs/lobster-v2-prd.md](docs/lobster-v2-prd.md) | Lobster encounters: command PRD + v2 expansion |
+| [PRD.md](PRD.md) | Shell Society nomination review — the product hermit was built around |
+| [progress.txt](progress.txt) | Lobster encounters running progress log |
 
 ## Scripts
 

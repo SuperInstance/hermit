@@ -1,94 +1,123 @@
-# Quilt Enhancement Audit — where SuperInstance tech greatly enhances hermit
+# Quilt Enhancement Audit — beyond the merged spine
 
-- **Date:** 2026-09-20
-- **Branch:** `readme-vision-audit` (docs-only; base `main` @ `adae217`)
-- **Scope:** `src/quilt/`, `src/tidepool/`, call sites in `src/data/`, `src/index.ts`, `wrangler.jsonc`, fleet repos (quilt-studio, tidepool, twist-engine, gesture-kit, duke-lab, quilt-canon-cli)
-- **Rules:** every claim cites a file actually read, pinned to the ref above. No behavior changes in this branch.
+*Lane AB² · 2026-09-20 · branch `readme-vision-audit` (from `main @ adae217`). Every claim was re-verified by local-clone grep and `bun test` in the Lane AB² sandbox — not via `gh code search`, whose index is stale on this repo (a warning worth repeating: one earlier verification pass believed `projectNominationVote` present on main because code search said so; the local clone and the test suite prove otherwise — see F1).*
 
-## Suite baseline on `main` @ `adae217`
-
-`bun test`: **296 pass, 22 fail, 16 errors, 1 todo** (319 tests, 49 files). The failures are pre-existing and fall into three buckets:
-
-1. **Broken import (16 errors across 15 test files).** `src/quilt/commit.ts:5-6` imports `projectNominationVote` and `VoteProjectionInput` from `./projection.js`; neither exists in `src/quilt/projection.ts`. Every test file that transitively imports `commit.ts` dies with `SyntaxError: Export named 'projectNominationVote' not found`. The export existed through `6c19e42` and was dropped by merge `707b1d5` (PR #4, "quilt kernel P4: adversarial-review fixes"). Main has been red since that merge.
-2. **Test/code drift (2 failures).** `tests/quiltWalHash.test.ts:41,61` expect `verifyChain(rows)` to be `true`; `src/quilt/projection.ts:113` returns a `ChainVerification` object (`{ ok: true, ... }`).
-3. **Environmental (4 failures).** The lobster artwork/asset tests shell out to `magick` and `dwebp`, which are absent in the audit sandbox. CI installs ImageMagick 7 and the WebP tools (README, CI/CD section), so these pass in CI.
-
-This branch changes only `README.md` and adds this file; the suite result is unchanged.
+**Method:** clone at pinned ref `adae217` → `bun install` → `bun test` → grep every claim. No code changes on this branch — every fix here is a recipe, not a commit.
 
 ---
 
-## F1 — Restore the P1 vote seam and wire the ops spine (D1 write batches → kernel ops)
+## Test baseline at `adae217` (verified this audit, Lane AB² sandbox)
 
-**Rank: 1** — deploy-blocking, one evening.
+Command: `bun install && bun test` (fresh sandbox: deps installed, `forms:css` codegen not run, ImageMagick/WebP absent).
 
-**WHAT EXISTS.** The commit seam is built and used: `src/quilt/commit.ts` wraps `appendBatch` in a CAS-guarded chain-tip read with optimistic retry (`QuiltChainConflictError`, single-batch `SELECT … FOR UPDATE` shape per the ledger docs). Call sites: `src/data/nominations.ts:248` (`commitNominationVoteProjection`), `src/data/lobsterEncounters.ts:142,510,573,679` (`commitProjection` for encounter/bind/publication/response), `src/tidepool/index.ts` (`rememberHelperThread`, plus `rememberChannelThreads` — N threads in ONE projection → ONE `mutation_id`, the hermit commit-batch shape). Ops counters: `src/quilt/ops.ts:35-58` (`recordWalCommit`, `recordWalFailure`, `getWalFailureCounts`, `getWalRowsCommitted`, `reconcileTick`). Drift detector: `src/quilt/reconcile.ts` (`reconcileQuiltWal`).
+Bun's summary: **262 pass · 25 fail · 19 errors · 1 todo — 288 tests across 49 files.**
 
-**WHAT'S MISSING.** Three gaps, all surfaced by the baseline above:
-- `src/quilt/projection.ts` no longer exports `projectNominationVote` / `VoteProjectionInput` (dropped by `707b1d5`), so the vote path cannot bundle; 16 test errors.
-- `recordWalCommit` has **zero callers** in `src/` — the rows-committed gauge is unwired.
-- `reconcileTick` exists but is **not wired** into the Worker's `scheduled()` handler (`src/index.ts:167-174` runs expiry, grant recovery, card-sync recovery, and the thread monitor only), despite two crons being configured (`wrangler.jsonc:53` — `*/15 * * * *`, `0 */2 * * *`). The drift detector ships but never runs.
-- Minor: the tidepool client counts failures locally (`src/tidepool/index.ts:8,35` — "forward-compatible with `src/quilt/ops.ts`"), but `"tidepool_projection"` is not in the `WalFailureKind` union (`src/quilt/ops.ts:10-18`), so wiring it as-is would be a type error.
+Error taxonomy (the 19 file-level errors):
 
-**SMALLEST FIRST BUILD (one evening).** Restore the two exports to `src/quilt/projection.ts` (recoverable from git history, e.g. `git show 6c19e42:src/quilt/projection.ts`); align `verifyChain` callers or its return shape; add `"tidepool_projection"` to `WalFailureKind`; wire `reconcileTick(env)` and `recordWalCommit(rows.length)` into `scheduled()` behind the existing `*/15` cron. Suite goes green; the ledger starts reporting its own health.
+| Bucket | Count | Cause |
+|--------|-------|-------|
+| Missing-export `SyntaxError` | ~15 files | `src/quilt/commit.ts:5` imports `projectNominationVote` / `VoteProjectionInput` from `./projection.js`; `src/quilt/projection.ts` at `adae217` (415 lines, 19 exports) has neither. Affects every quilt-kernel suite plus the nomination suites (`quiltKernelOps`, `quiltKernelReplay`, `quiltKernelReconcile`, `quiltKernelEncounters`, `quiltKernelTidepool`, `quiltKernelReviewFixes`, `quiltCommitConcurrency`, `nominationVoting`, `nominationRoleGrant`, `nominationExpiry`, `nominationCardSync`, `nominationReviewCard`, `nominateCommand`, …) |
+| Missing forms build artifact | remainder | `Cannot find module '../styles.generated.js'` (`src/forms/components/Layout.tsx:2`) — fixed by `bun run forms:css` (package.json:20). Sandbox-only; CI and a normal dev setup run the codegen |
 
----
+Named failures (the 6 unique `(fail)` lines):
 
-## F2 — Project helper memories into the fleet tidepool (memory vectors → tidepool)
+| Test | File:line | Cause |
+|------|-----------|-------|
+| chain verifies end-to-end / genesis continuity | `tests/quiltWalHash.test.ts:41,61` | `verifyChain` returns a `ChainVerification` object (`{ok:true}` / `{ok:false,firstBadSeq}`, `src/quilt/projection.ts:113-127`); the tests assert `.toBe(true/false)`. Real test/code drift — F1's build fixes it |
+| 4 lobster-art failures | `tests/lobster*.test.ts` | `magick`/`dwebp` binaries absent in this sandbox. CI installs both (`.github/workflows/ci.yml`, step "Install artwork test tools") — environmental, not defects |
 
-**Rank: 2** — high value, high feasibility, one evening.
-
-**WHAT EXISTS.** `src/tidepool/index.ts:40-118` — the full local client: `rememberHelperThread` dual-writes (ocean markdown + WAL projection, returning the WAL rows read back from the ledger); `rememberChannelThreads` does batch projection; failures are caught and counted, never thrown into the helper path (the P1/P2 risk posture). `src/tidepool/ocean.ts` — append-only markdown ocean with token-overlap recall. `src/tidepool/stall.ts` — `detectQuietThreads` (window = 3 polls), projected as quiet-thread facts. `helper_threads` D1 table as the materialized view. The fleet target is specced: [SuperInstance/tidepool](https://github.com/SuperInstance/tidepool) — `POST /api/remember` (≤200-word distill, fire-and-forget), `GET /api/recall`, Cloudflare Vectorize embedding, `native` 16-number domain fingerprints.
-
-**WHAT'S MISSING.** No HTTP client to the fleet ocean; recall is token-overlap only; there are no embeddings anywhere in hermit (a deliberate constraint, so the projection must distill, not embed).
-
-**SMALLEST FIRST BUILD.** In `rememberHelperThread`'s success path, add a fire-and-forget `POST /api/remember` (kind: `playtest`/`session`, author: `hermit`, body: the thread summary distilled to ≤200 words), gated on an optional `TIDEPOOL_URL` env var. Absence of the var is a no-op — the local ocean stays authoritative. This is exactly the fleet protocol's "WRITE at task end, never blocks" rule.
+**Conclusion: `main` is red, and the red is structural, not environmental.** The missing export is a load-time `SyntaxError`: any import of `src/quilt/commit.ts` (i.e., every nomination vote write path) throws before first use.
 
 ---
 
-## F3 — `quilt-doctor`: one command that replays the whole ledger (emergent)
+## F1 — Restore the vote projection seam (P0; one commit)
 
-**Rank: 3** — high value, very high feasibility, one evening.
+**WHAT EXISTS.** `commitNominationVoteProjection` is the vote-path projection entrypoint (`src/quilt/commit.ts`), called from `src/data/nominations.ts:248` on every vote write. It is fully implemented and imported.
 
-**WHAT EXISTS.** All the pieces, tested separately: `verifyChain` (`src/quilt/projection.ts:113`), `reconcileQuiltWal` (`src/quilt/reconcile.ts`), refusal topology `analyzeRefusals` (`src/quilt/projection.ts:311`), `detectQuietThreads` (`src/tidepool/stall.ts`), ops counters (`src/quilt/ops.ts`), and a proven CLI pattern — `src/quilt/canon-ledger.ts` already runs as a script (`bun run src/quilt/canon-ledger.ts [repoPath]`, `import.meta.main` guard).
+**WHAT'S MISSING.** Its row-builder. `src/quilt/commit.ts:3-7` imports `buildWalRows, projectNominationVote, type VoteProjectionInput, type WalRow` from `./projection.js`, but `src/quilt/projection.ts` at `adae217` exports neither `projectNominationVote` nor `VoteProjectionInput` (19 exports, verified by grep; remote cross-checked via `raw.githubusercontent.com/SuperInstance/hermit/adae217/src/quilt/projection.ts` — identical 415-line file, so the clone is not the artifact). Both existed at `cb8a35c` (`VoteProjectionInput` line 46, `projectNominationVote` line 71) and `6c19e42` — the merge chain that produced `adae217` dropped them.
 
-**WHAT'S MISSING.** No operator-facing digest. The "ledger reports its own health" doctrine (P5) covers the vote path's counters, but nothing replays the WAL end-to-end and prints fleet health; today that knowledge only exists inside per-piece tests.
+**SMALLEST BUILD (one commit, before F2–F5 matter):**
 
-**SMALLEST FIRST BUILD.** `src/quilt/doctor.ts` with the same CLI shape: replay the WAL, run reconciliation, print chain verification + drift summary + refusal topology + quiet-thread count + ops counters; exit non-zero on any red. Add one CI step. The canon ledger gains a sibling: one verifies the claim, the other verifies the body.
+```
+git show cb8a35c:src/quilt/projection.ts        # recovery source
+```
 
----
+Re-add `VoteProjectionInput` + `projectNominationVote` from `cb8a35c:src/quilt/projection.ts` (lines 46–95) into the current file — **surgical re-add, not a wholesale file restore**: current `projection.ts` carries newer `buildWalRows` edge-synthesis and `verifyChain` shape that must not be reverted. Then either adapt `verifyChain`'s return to the tests' boolean expectation (`tests/quiltWalHash.test.ts:41,61`) or update those two assertions to `.toEqual({ok:true})` / `{ok:false, firstBadSeq:…}` — the object shape is newer and richer, so amending the tests is the honest direction. Acceptance: `bun test` green except the sandbox-environment buckets above.
 
-## F4 — Cadence surface → `commensurate.mjs` exact-rational tuning
-
-**Rank: 4** — medium-high value, high feasibility, one evening.
-
-**WHAT EXISTS.** The cadence surface: action cooldowns (`src/data/actionCooldowns.ts`, consumed at `src/data/lobsterEncounters.ts:16-19`; refusal rows are first-class negative-ledger facts, `src/data/lobsterEncounters.ts:100`), the stall detector (`src/tidepool/stall.ts`, window 3), Worker crons (`wrangler.jsonc:53` — every 15 minutes and every 2 hours), `THREAD_LENGTH_CHECK_INTERVAL_HOURS` (README Setup). The instrument: `commensurate.mjs` ([SuperInstance/quilt-studio](https://github.com/SuperInstance/quilt-studio), `packages/quilt-floor/src/commensurate.mjs`) — `floatToRat` (f64 bits → exact BigInt rational), Stern–Brocot search, nearest small-denominator rational, exact tie-breaks.
-
-**WHAT'S MISSING.** All cadence constants are raw integers scattered across config, env, and defaults. Nothing checks whether the 15-minute cron and the 2-hour monitor land on commensurate points relative to cooldown expiry — the duke-lab/q16 doctrine (tune against a measured ruler) is unapplied to time.
-
-**SMALLEST FIRST BUILD.** Extract every cadence constant into one table expressed as exact rationals (cooldown seconds, poll intervals, expiry windows) with the poll:cooldown ratios snapped to small denominators via `commensurate.mjs`. Pure config move; no behavior change until ratios are deliberately retuned.
+**Why this ranks first:** main is red. Every other enhancement rides a green suite.
 
 ---
 
-## F5 — Reply-honesty metering → twist-engine σ-shear / gesture-kit torsion
+## F2 — Memory vectors: tidepool ocean → fleet tidepool + Vectorize
 
-**Rank: 5** — high value, medium feasibility (the geometry needs defining without embeddings).
+**WHAT EXISTS.** `src/tidepool/index.ts` (the hermit-facing tidepool v1 API: `rememberHelperThread`, dual-write to ocean markdown + quilt WAL, lines 35-62), `src/tidepool/ocean.ts`, `src/tidepool/projection.ts` (`projectHelperThread`, `projectQuietThread`, `readWalRowsByMutation`), `src/tidepool/stall.ts` (quiet-thread detector). The fleet target is specced in [SuperInstance/tidepool](https://github.com/SuperInstance/tidepool): `POST /api/remember {kind, author, title, body, native?, repo?, run?}` with a ≤200-word distill at task end (README lines 13-15), `GET /api/recall?q=...` hybrid recall (line 17), Cloudflare Vectorize indexes `tidepool-native` (16-dim structural fingerprints, `wrangler vectorize create tidepool-native --dimensions=16 --metric=cosine`) and `tidepool-semantic` (768-dim BGE at write time).
 
-**WHAT EXISTS.** Deterministic reply engines (slap, lobster) whose outputs are seed-reproducible; helper-log response recording; the refusal analyzer (`src/quilt/projection.ts:311`); token-overlap recall (`src/tidepool/ocean.ts`). Instruments: twist-engine's registration R(θ) — mean gaussian alignment, σ-shear at σ = 0.24·s, S = 1 − R, commensuration comb — computed, never asserted ([SuperInstance/twist-engine](https://github.com/SuperInstance/twist-engine)); gesture-kit's order-by-order path geometry ([SuperInstance/gesture-kit](https://github.com/SuperInstance/gesture-kit)) — `arcLength`/`heading` (1st), `bendingEnergy` (2nd), `twistEnergy` (3rd: **torsion**, turning out of the plane).
+**WHAT'S MISSING.** Hermit's tidepool never leaves the machine: ocean markdown lives in-repo, `src/tidepool/index.ts:35` (`let walFailureCount = 0`) counts WAL projection failures into a local counter whose own docstring (lines 8-10) says it wires into `recordWalFailure("tidepool_projection")` "when PR #5 lands" — PR #5 **has** landed (`src/quilt/ops.ts`), but the `WalFailureKind` union (`src/quilt/ops.ts:10-18`) still lacks `"tidepool_projection"`, so the counter still goes nowhere. No Vectorize binding exists in `wrangler.jsonc`; nothing embeds helper-thread memory bodies.
 
-**WHAT'S MISSING.** No instrument measures whether a bot reply's trajectory through reply-space stays honest to the history it claims to summarize. A reply can be fluent, on-topic, and still leave the plane of the record it cites.
+**SMALLEST BUILD (one evening):** add `"tidepool_projection"` to the `WalFailureKind` union and call `recordWalFailure("tidepool_projection", e)` at the catch site (`src/tidepool/index.ts:51`, the `rememberHelperThread` catch whose local counter sits at :35), replacing the local counter — the seam the file's own comment already promises. Then a `client → /api/remember` relay behind the existing bearer-token posture (mirror `src/server/helperLogsServer.ts:66-82`): `kind:"helper_thread"`, `body` = the ≤200-word distill of the thread, `native` = the 16-number domain fingerprint the ocean already derives per section. Binds `hermit-tidepool` + `tidepool-native`/`tidepool-semantic` Vectorize indexes in `wrangler.jsonc`. Test: extend `tests/quiltKernelTidepool.test.ts` to assert the failure kind increments once per forced projection throw.
 
-**SMALLEST FIRST BUILD.** A shadow report, not a gate: project each reply and its claimed source thread as `Gesture`s through token-frequency space (hermit deliberately has no embeddings, so the geometry is vocabulary-shaped), compute `gestureDistance(reply, source)` and `twistEnergy(reply)`; flag replies with high torsion relative to their source alignment. Log the digest as a WAL `EFFECT` row. Name the law explicitly: a *twist* is the deliberate offset; *torsion* is the third-order measure of a path leaving its plane — conflating them corrupts both instruments.
+**Why this ranks second:** it converts hermit's conversational memory from write-only journaling into the fleet's recallable ocean — the "memory surface" half of the mission statement, made true.
 
 ---
 
-## Terminology law
+## F3 — Ship the ops counters: wire `reconcileTick` into cron + export health (P0; one cron line + one handler)
 
-**Torsion ≠ twist.** A twist is the deliberate offset between identical layers (twist-engine's law: no new atoms, a new angle). Torsion is gesture-kit's third-order measure — turning *out of* the plane a path already bends in. Hermit's cadences are twists; hermit's replies can be metered for torsion. The two words must not be exchanged anywhere in fleet docs.
+**WHAT EXISTS.** `src/quilt/ops.ts` is complete and honest: `recordWalFailure(kind, error)` (line 36), `getWalFailureCounts()` (line 45), `recordWalCommit(rows)` (line 53), `getWalRowsCommitted()` (line 60), and `reconcileTick(client)` (line 66) — a cron-ready wrapper around the reconciliation pass that returns a summary instead of throwing. Its docstring names the intended caller: "Scheduled handlers (`wrangler: [triggers] crons`) call this."
 
-## Top 5, ranked
+**WHAT'S MISSING.** Nothing calls them. `grep -rn "recordWalCommit" src/` finds zero call sites outside `ops.ts`; `reconcileTick` is not wired into the `scheduled()` handler (`src/index.ts:167-176` runs nomination expiry/recovery/card-sync + thread-length monitor only); `wrangler.jsonc:52-54` fires `"*/15 * * * *"` and `"0 */2 * * *"` with no quilt reconcile beat. The counters are a dashboard no cron ever reads. Also unwired: `src/quilt/canon-ledger.ts` (canon upkeep — candidate (d) below) runs only as a manual script (`import.meta.main`, line 227; `process.exit(1)` on failure, line 231) with no CI step (`.github/workflows/ci.yml` has no canon step; package.json has no canon script).
 
-1. **F1** — Restore `projectNominationVote` + wire `reconcileTick`/`recordWalCommit`: main is red, the fix is one evening.
-2. **F2** — Fire-and-forget tidepool projection: hermit's memories join the fleet ocean.
-3. **F3** — `quilt-doctor` CLI: one command replays the ledger and reports fleet health.
-4. **F4** — `commensurate.mjs` cadence tuning: exact rationals for poll/cooldown ratios.
-5. **F5** — Reply-honesty metering: σ-shear/torsion digest of reply-vs-history as a shadow WAL effect.
+**SMALLEST BUILD (one evening):** (1) in `src/index.ts` `scheduled()`, add `ctx.waitUntil(reconcileTick(client))` on the 2-hour cron (`controller.cron === "0 */2 * * *"`); (2) extend `src/server/helperLogsServer.ts` with `/api/quilt/health` returning `{failureCounts, rowsCommitted, lastReconcile}` from the ops getters, bearer-gated like `/api/events`; (3) add a CI step running `bun run src/quilt/canon-ledger.ts` so canon drift fails the build — one line, subsumes candidate (d). No schema change; no new table. Test: one test asserting `reconcileTick` runs on the 2-hour tick and increments `getWalRowsCommitted()`.
+
+**Why this ranks third:** it turns the spine's health from "log and forget" into an alertable signal — and it is the cheapest possible build on this list.
+
+---
+
+## F4 — Helper-thread cadence: a commensurate pattern for cooldown + stall intervals
+
+**WHAT EXISTS.** The cadence machinery is real and tunable-but-unmeasured: action cooldowns as chosen constants (`src/data/actionCooldowns.ts:1-15` — `actionCooldownDurations`, `actionCooldownExpiries`), the thread-length monitor's poll horizon (`src/services/threadLengthMonitor.ts:26` — `THREAD_LENGTH_CHECK_INTERVAL_HOURS`, env-tunable, asserted), the quiet-thread stall detector (`src/tidepool/stall.ts:28` — `detectQuietThreads`, `{window = 3}` asserted), and refusal outcomes (`src/services/slapEngine.ts:46,187`) that are already first-class WAL rows (`src/quilt/projection.ts:186-228` — *"the reef of encounters that never were"*). The fleet's doctrine source is [SuperInstance/twist-engine](https://github.com/SuperInstance/twist-engine): *"Five substrates, one law… each with a live ledger measuring the emergent quantity instead of asserting it"* (README). Its TWIST substrate measures registration R(θ) *"computed, never asserted… kept honest by `tests/sim.test.js`"* and derives the **commensuration comb** — evenly spaced teeth where the supercell revives.
+
+**WHAT'S MISSING.** Hermit has no commensurate instrument. No script reads the WAL's own cadence topology (refusal rows, stall clusters, TICK beats) to tune `actionCooldownDurations`, the monitor horizon, or the stall window — all three are asserted values sitting on top of a ledger that already records the material they govern. The fleet's exactness tool for the tooth-spacing question already exists: [SuperInstance/quilt-studio](https://github.com/SuperInstance/quilt-studio) `packages/quilt-floor/src/commensurate.mjs` (verified: f64 bits → exact BigInt rational via `floatToRat`, Stern–Brocot search to the nearest small-denominator rational, tie-broken exactly) — the cadence report should borrow that arithmetic, not re-derive it with float tolerance.
+
+**SMALLEST BUILD (one evening):** `scripts/cadence-report.mjs` — offline analysis over `quilt_wal`: bin refusal/EFFECT/TICK rows by window (1h/6h/24h), fit the cadence comb's tooth spacing with commensurate.mjs's exact rational arithmetic (vendored or imported — it is one file), and write `docs/cadence-report.md` with recommended cooldown/interval values plus the measured residue. Run weekly; adopt a value only when the report supports it. Test: extend `tests/quiltKernelOps.test.ts` with a fixture WAL where a known cadence produces a known recommendation. No runtime dependency on twist-engine or quilt-studio — the doctrine and the arithmetic are imported, the instrument is hermit's own.
+
+> **Audit integrity note.** An earlier draft of this finding cited `commensurate.mjs` inside twist-engine with a 12-field reading schema. Verified against every branch of that repo: absent. The schema belonged to gesture-kit; the arithmetic belongs to quilt-studio; the doctrine belongs to twist-engine. All three citations above are verified at their real homes.
+
+**Why this ranks fourth:** cheap, offline, and it makes every other cadence decision on this list defensible — values tuned against the ledger instead of asserted over it.
+
+---
+
+## F5 — Reply honesty: an instrument channel over the refusal ledger
+
+**WHAT EXISTS.** The material is already honest: refusal rows are first-class WAL citizens (*"the refusal rows ARE the cooldown topology"*, `src/quilt/projection.ts:186-228`), refusal outcomes are scored in the engines (`src/services/slapEngine.ts:46,187`; `src/services/lobsterEngine.ts`), quiet threads are detected on a fixed window (`src/tidepool/stall.ts:28`), and the thread monitor runs on its env-tunable horizon (`src/services/threadLengthMonitor.ts:26`). Everything hermit needs to *measure* conversational strain is in the ledger; what it does with it is nothing — the cadences stay fixed regardless.
+
+**WHAT'S MISSING.** The instrument channel. The fleet doctrine (twist-engine README) is *computed, never asserted* — the ledger measures the emergent quantity and the instrument reads the same quantity the curve claims. Hermit asserts reply cadence health; it never computes it from the refusal/stall material it already records.
+
+**SMALLEST BUILD (one evening):** `scripts/reply-honesty.mjs` — offline; reads refusal/stall/EFFECT topology per thread window from `quilt_wal` as an ordered sequence of numeric vectors (refusal rate, stall flag, effect burst size per tick) and runs [SuperInstance/gesture-kit](https://github.com/SuperInstance/gesture-kit)'s path geometry over it (verified API: `g.arcLength()`/`g.heading()` 1st order, `g.bendingEnergy()` 2nd, `g.twistEnergy()` 3rd — torsion, turning that leaves the plane). Flags threads where 3rd-order torsion diverges from the cadence expectation and writes `docs/reply-honesty.md` with per-thread flags + the aggregate residue. Test: fixture WAL with known divergence → known flag, asserted via `bun test`. No runtime dependency — offline analysis only, like F4.
+
+> **Audit integrity note.** An earlier draft attributed the field names (`twistEnergy`, `bendingEnergy`) to twist-engine. They are gesture-kit's methods (verified in its README); twist-engine contributes the *computed, never asserted* doctrine. Cited at their real homes above.
+
+**Why this ranks fifth:** it closes the loop between what hermit does (replies on cadence) and what its own ledger says the material did (strained or not) — the honesty layer the fleet's doctrine demands.
+
+---
+
+## Candidates evaluated and deferred
+
+The brief's candidates (d) canon-ledger upkeep and (e) guild forms → VIEW projections were verified in-tree and deferred — with reasons, per the audit's rules:
+
+**(d) Canon-ledger upkeep — deferred, folded into F3.** Verified: `src/quilt/canon-ledger.ts` runs as a manual script (`import.meta.main:227`, `exit(1)` on replay failure:231) against `CANON.md` front matter (`canon:1`, `feeds:[tidepool, duke-lab]`, `owed_by:[quilt]`, `canonical_docs:[README.md, drizzle/0013_quilt_kernel_wal.sql, src/quilt/commit.ts]`), replaying the git log with an FNV-1a 64 hash. It fails the replay if a canonical doc is removed or a claim drops a feed while kernel commits still exist. But nothing runs it: no CI step (`.github/workflows/ci.yml`), no package.json script. Rather than rank it alone, its one-line CI build rides F3 — same step, same evening.
+
+**(e) Guild forms → VIEW projections — deferred, rank #6.** Verified: the forms surface is real and busy (`forms.config.ts` — ban/mute appeals, ClawHub appeals, moderator reports, review roles), but `grep -rn "quilt\|wal" src/forms/` returns nothing: form submissions, reviews, accept/deny transitions write D1 rows and never touch the ledger. The seam is a VIEW projection per form lifecycle beat (submission → review → verdict) riding `commitProjection` exactly like encounters do (`src/data/lobsterEncounters.ts:142,510,573,679`). Deferred because the review semantics (what does a denied appeal *mean* in WAL terms — EFFECT? a negative ledger entry like encounters' shadow?) deserve a design pass before a build, and F1–F5 all outrank it on value×feasibility today. If picked up: start with moderator reports only — the smallest form with the crispest lifecycle.
+
+---
+
+## Summary — top 5, ranked
+
+| # | Enhancement | One line |
+|---|-------------|----------|
+| F1 | Restore the vote projection seam | `main` is red: re-add `projectNominationVote`/`VoteProjectionInput` from `cb8a35c` — surgical, one commit |
+| F2 | Memory vectors → fleet tidepool | WAL failure counter → `recordWalFailure("tidepool_projection")`; relay distilled helper memories to `/api/remember` + Vectorize |
+| F3 | Ship the ops counters | `reconcileTick` on the 2-hour cron + `/api/quilt/health` + canon-ledger CI step |
+| F4 | Cadence via commensurate pattern | Offline `scripts/cadence-report.mjs` tunes cooldown/interval constants against measured WAL topology |
+| F5 | Reply honesty via torsion instrument | Offline `scripts/reply-honesty.mjs` flags threads where instrument reading disagrees with reply cadence |
+
+*Deferred (verified, rank #6): guild forms → VIEW projections. Folded into F3: canon-ledger CI step.*
