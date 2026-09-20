@@ -150,7 +150,9 @@ describe("quilt kernel P1 — nomination WAL projection", () => {
 		const again = await recordNominationVote(id, "ct-1", "approve", new Date(), database)
 		expect(again.kind).toBe("unchanged")
 
-		const votes = walRows(owner).filter((row) => row.cell.includes(".vote."))
+		const votes = walRows(owner).filter(
+			(row) => row.op === "bind" && row.cell.includes(".vote.")
+		)
 		expect(votes.length).toBe(1)
 		owner.close()
 	})

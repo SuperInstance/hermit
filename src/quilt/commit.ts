@@ -139,3 +139,69 @@ export const commitNominationVoteProjection = async (
 	}
 	return rows.length
 }
+
+// Generic projector: run `project` against a fresh kernel, drain the
+// events, append hash-chained WAL rows in ONE batch. Returns rows written.
+// (Added in PR #2 — encounters dual-write uses this; vote path uses
+// commitNominationVoteProjection above, which wraps this with the
+// nomination-specific projection.)
+export const commitProjection = async (
+	client: WalClient,
+	context: CommitContext,
+	project: (kernel: QuiltKernel) => void
+): Promise<number> => {
+	const kernel = new QuiltKernel()
+	const events: QuiltEvent[] = []
+	const unsubscribe = kernel.subscribe((event) => {
+		events.push(event)
+	})
+	project(kernel)
+	unsubscribe()
+
+	if (events.length === 0) return 0
+
+	const [tipResult] = await client.batch<ChainTip>([
+		client.prepare(
+			`select coalesce(max(seq), 0) as tip,
+			 (select hash from quilt_wal order by seq desc limit 1) as prev
+			 from quilt_wal`
+		)
+	])
+	const tipRow = tipResult?.results?.[0] ?? { tip: 0, prev: null }
+	const rows = buildWalRows(events, {
+		mutationId: context.mutationId,
+		ts: context.ts,
+		tip: Number(tipRow.tip ?? 0),
+		prevHash: tipRow.prev ?? null
+	})
+	if (rows.length === 0) return 0
+
+	await client.batch(
+		rows.map((row: WalRow) =>
+			client.prepare(
+				`insert into quilt_wal
+				 (mutation_id, ts, cell, op, value, prev_hash, hash)
+				 values (?, ?, ?, ?, ?, ?, ?)
+				 ${rows.indexOf(row) === 0
+					? `where not exists (
+							select 1 from quilt_wal where prev_hash = ?
+						)`
+					: `where exists (
+							select 1 from quilt_wal where hash = ?
+						)`}`,
+				[
+					row.mutation_id,
+					row.ts,
+					row.cell,
+					row.op,
+					row.value,
+					rows.indexOf(row) === 0 ? row.prev_hash : row.prev_hash,
+					row.hash,
+					rows.indexOf(row) === 0 ? row.prev_hash : row.prev_hash
+				]
+			)
+		)
+	)
+	return rows.length
+}
+
