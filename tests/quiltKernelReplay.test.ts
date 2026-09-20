@@ -82,7 +82,7 @@ describe("quilt kernel P1 — nomination WAL projection", () => {
 
 		const rows = walRows(owner)
 		expect(rows.length).toBeGreaterThan(0)
-		expect(verifyChain(rows)).toBe(true)
+		expect(verifyChain(rows).ok).toBe(true)
 
 		const cells = new Set(rows.map((row) => row.cell))
 		expect(cells.has(`nomination.${id}.status`)).toBe(true)
@@ -99,7 +99,7 @@ describe("quilt kernel P1 — nomination WAL projection", () => {
 		expect(third.kind).toBe("granting")
 
 		const rows = walRows(owner)
-		expect(verifyChain(rows)).toBe(true)
+		expect(verifyChain(rows).ok).toBe(true)
 		const replayed = replayNominationFromWal(rows, id)
 		expect(replayed).not.toBeNull()
 		expect(replayed?.status).toBe("granting")
@@ -169,7 +169,7 @@ describe("quilt kernel P1 — nomination WAL projection", () => {
 		const tampered = rows.map((row, index) =>
 			index === voteRowIndex ? { ...row, value: '"decline"' } : row
 		)
-		expect(verifyChain(tampered)).toBe(false)
+		expect(verifyChain(tampered).ok).toBe(false)
 
 		const replayed = replayNominationFromWal(tampered, id)
 		expect(replayed?.votes[0]?.choice).toBe("decline")
@@ -184,7 +184,7 @@ describe("quilt kernel P1 — nomination WAL projection", () => {
 		expect(expired.kind).toBe("expired")
 
 		const rows = walRows(owner)
-		expect(verifyChain(rows)).toBe(true)
+		expect(verifyChain(rows).ok).toBe(true)
 		expect(rows.some((row) => row.cell.endsWith(".vote.ct-1"))).toBe(false)
 		const replayed = replayNominationFromWal(rows, id)
 		expect(replayed?.status).toBe("expired")
