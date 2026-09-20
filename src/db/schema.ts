@@ -496,3 +496,14 @@ export const quiltWal = sqliteTable(
 	]
 )
 export type QuiltWalRow = typeof quiltWal.$inferSelect
+
+// Single-row claim lock serializing WAL commits across Worker isolates.
+// Review finding #1: two interleaved commitProjection calls both read the
+// same chain tip, then both insert — the hash chain self-invalidates
+// permanently, silently. An in-memory mutex cannot hold across isolates;
+// the lock lives in D1, claimed and released around each commit.
+export const quiltWalLock = sqliteTable("quilt_wal_lock", {
+	id: integer().primaryKey(),
+	holder: text().notNull(),
+	acquiredAt: text("acquired_at").notNull()
+})
