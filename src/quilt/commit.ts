@@ -18,31 +18,47 @@ type WalClient = {
 
 export type ChainTip = { tip: number; prev: string | null }
 
-// Lane D (2026-09-20): the tip read and the row insert are two separate
-// batches, so two concurrent commits can read the SAME tip and both chain
-// to the SAME prev_hash — a genuine hash-chain fork. Drizzle 0014 adds a
-// UNIQUE index on quilt_wal.prev_hash that turns that race into a hard
-// constraint error; here we treat the error as a lost compare-and-swap and
-// re-read the tip + rechain (optimistic retry). Genuine D1 failures still
-// throw — the vote path's catch-and-log dual-write posture is unchanged.
-const MAX_CHAIN_ATTEMPTS = 8
+// Lane C audit (2026-09-20), bug #1: the tip read and the row insert used
+// to be two independent batch() calls with no guard between them, so two
+// concurrent commits could both read tip T and both chain a row from the
+// same prev_hash — a genuine hash-chain fork. Single-writer was a
+// deployment convention, not a construction.
+//
+// Fix, three layers deep:
+//   1. every row's INSERT is guarded and all rows land in ONE batch:
+//      the anchor row refuses a prev_hash that is already chained
+//      (`WHERE NOT EXISTS`), and each following row requires its
+//      predecessor's hash to exist (`WHERE EXISTS`) — so if the anchor
+//      loses the race, the whole chain transitively appends nothing;
+//   2. the tip is re-verified against our final hash after the batch — a
+//      losing writer throws QuiltChainConflictError instead of silently
+//      returning success for a chain it never extended;
+//   3. migration 0014's UNIQUE INDEX on prev_hash is the durable backstop:
+//      even if both layers above are somehow defeated, the database
+//      refuses the fork loudly. (prev_hash is NOT NULL — genesis rows
+//      store the literal GENESIS — so the index also enforces a single
+//      genesis anchor.)
+export class QuiltChainConflictError extends Error {
+	readonly expectedPrevHash: string
 
-const isChainConflict = (error: unknown): boolean => {
-	const message = error instanceof Error ? error.message : String(error)
-	return /UNIQUE constraint failed: quilt_wal\.prev_hash/.test(message)
+	constructor(expectedPrevHash: string) {
+		super(
+			`quilt WAL chain conflict: prev_hash ${expectedPrevHash} was already consumed by another commit`
+		)
+		this.name = "QuiltChainConflictError"
+		this.expectedPrevHash = expectedPrevHash
+	}
 }
 
-const TIP_READ = `select coalesce(max(seq), 0) as tip,
-			(select hash from quilt_wal order by seq desc limit 1) as prev
-		 from quilt_wal`
+const TIP_QUERY = `select coalesce(max(seq), 0) as tip,
+	(select hash from quilt_wal order by seq desc limit 1) as prev
+ from quilt_wal`
 
-const ROW_INSERT = `insert into quilt_wal
-					(mutation_id, ts, cell, op, value, prev_hash, hash)
-				 values (?, ?, ?, ?, ?, ?, ?)`
-
-// Project a vote into kernel ops and append the hash-chained WAL rows in
-// ONE batch. Returns the number of rows committed. Throws only on D1
-// failure — callers in the vote path catch and log (dual-write posture).
+// Project a vote into kernel ops and append the hash-chained WAL rows.
+// Returns the number of rows committed. Throws QuiltChainConflictError if
+// another writer won the tip between our read and our insert; throws only
+// on D1 failure otherwise — callers in the vote path catch and log
+// (dual-write posture).
 export const commitNominationVoteProjection = async (
 	client: WalClient,
 	input: VoteProjectionInput
@@ -55,43 +71,71 @@ export const commitNominationVoteProjection = async (
 	projectNominationVote(kernel, input)
 	unsubscribe()
 
-	let lastConflict: unknown = null
-	for (let attempt = 0; attempt < MAX_CHAIN_ATTEMPTS; attempt += 1) {
-		const [tipResult] = await client.batch<ChainTip>([
-			client.prepare(TIP_READ)
-		])
-		const tipRow = tipResult?.results?.[0] ?? { tip: 0, prev: null }
-		const rows = buildWalRows(events, {
-			mutationId: input.mutationId,
-			ts: input.ts,
-			tip: Number(tipRow.tip ?? 0),
-			prevHash: tipRow.prev ?? null
-		})
-		if (rows.length === 0) return 0
+	const [tipResult] = await client.batch<ChainTip>([
+		client.prepare(TIP_QUERY)
+	])
+	const tipRow = tipResult?.results?.[0] ?? { tip: 0, prev: null }
+	const rows = buildWalRows(events, {
+		mutationId: input.mutationId,
+		ts: input.ts,
+		tip: Number(tipRow.tip ?? 0),
+		prevHash: tipRow.prev ?? null
+	})
+	if (rows.length === 0) return 0
 
-		try {
-			await client.batch(
-				rows.map((row: WalRow) =>
-					client
-						.prepare(ROW_INSERT)
-						.bind(
-							row.mutation_id,
-							row.ts,
-							row.cell,
-							row.op,
-							row.value,
-							row.prev_hash,
-							row.hash
-						)
+	await client.batch(
+		rows.map((row: WalRow, index: number) =>
+			client
+				.prepare(
+					// guarded chain, one batch. Anchor row: refuse to consume a
+					// prev_hash that is already chained. Every later row requires
+					// its predecessor's hash to be present — so if the anchor
+					// loses the race, the whole batch transitively appends
+					// nothing, never a partial fork.
+					`insert into quilt_wal
+						(mutation_id, ts, cell, op, value, prev_hash, hash)
+					 select ?, ?, ?, ?, ?, ?, ?
+					 where ${
+						index === 0
+							? `not exists (
+								select 1 from quilt_wal where prev_hash = ?
+							)`
+							: `exists (
+								select 1 from quilt_wal where hash = ?
+							)`
+					}`
 				)
-			)
-			return rows.length
-		} catch (error) {
-			if (!isChainConflict(error)) throw error
-			lastConflict = error
-		}
+				.bind(
+					row.mutation_id,
+					row.ts,
+					row.cell,
+					row.op,
+					row.value,
+					row.prev_hash,
+					row.hash,
+					// guard parameter: the row's prev_hash in both flavors
+					row.prev_hash
+				)
+		)
+	)
+
+	// Re-verify the tip: our chain landed iff the current tip hash is our
+	// final hash and the sequence advanced by exactly our row count. Any
+	// other outcome means another writer won the race (or the batch
+	// partially applied) — refuse to report success for a chain we never
+	// extended.
+	const [afterResult] = await client.batch<ChainTip>([
+		client.prepare(TIP_QUERY)
+	])
+	const afterRow = afterResult?.results?.[0]
+	const expectedTip = Number(tipRow.tip ?? 0) + rows.length
+	const finalHash = rows[rows.length - 1].hash
+	if (
+		!afterRow ||
+		Number(afterRow.tip ?? 0) !== expectedTip ||
+		(afterRow.prev ?? null) !== finalHash
+	) {
+		throw new QuiltChainConflictError(rows[0].prev_hash)
 	}
-	throw lastConflict instanceof Error
-		? lastConflict
-		: new Error("quilt WAL commit exhausted chain attempts")
+	return rows.length
 }
