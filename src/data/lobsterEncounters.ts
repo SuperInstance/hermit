@@ -5,6 +5,7 @@ import {
 	type LobsterEncounter
 } from "../db/schema.js"
 import { commitProjection } from "../quilt/commit.js"
+import { recordWalFailure } from "../quilt/ops.js"
 import {
 	projectLobsterEncounter,
 	projectLobsterPublication,
@@ -144,7 +145,7 @@ const projectEncounterSafely = async (
 			(kernel) => projectLobsterEncounter(kernel, projection)
 		)
 	} catch (error) {
-		console.warn("quilt wal encounter projection failed", error)
+		recordWalFailure("encounter_projection", error)
 	}
 }
 
@@ -518,7 +519,7 @@ export const bindLobsterMessage = async (
 					})
 			)
 		} catch (error) {
-			console.warn("quilt wal bind projection failed", error)
+			recordWalFailure("bind_projection", error)
 		}
 	}
 	return { kind, encounter }
@@ -581,7 +582,7 @@ export const markLobsterPublicationFailed = async (
 					})
 			)
 		} catch (error) {
-			console.warn("quilt wal publication projection failed", error)
+			recordWalFailure("publication_projection", error)
 		}
 		return { kind: "marked_failed", encounter }
 	}
@@ -687,7 +688,7 @@ export const recordLobsterResponse = async (
 					})
 			)
 		} catch (error) {
-			console.warn("quilt wal response projection failed", error)
+			recordWalFailure("response_projection", error)
 		}
 	}
 	return { kind, encounter }
