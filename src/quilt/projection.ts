@@ -43,6 +43,23 @@ export type WalRow = {
 	hash: string
 }
 
+export type VoteProjectionInput = {
+	nominationId: number
+	reviewerId: string
+	choice: "approve" | "decline"
+	resultKind:
+		| "recorded"
+		| "switched"
+		| "granting"
+		| "declined"
+		| "expired"
+	status: string
+	totals: { approvals: number; declines: number }
+	completedAt: string | null
+	mutationId: string
+	ts: string
+}
+
 export type KernelLike = {
 	bind(name: string, value?: unknown, meta?: unknown): unknown
 	link(from: string, to: string, type: string): string
@@ -55,7 +72,27 @@ export type KernelLike = {
 // update quilt_wal can recompute a valid suffix. Upgrade path: swap fnv1a
 // for sha256 over the same input string; verifyChain's row format is
 // hash-function-agnostic. Do not cite the WAL in audit context until the
-// sha256 upgrade lands.// Turn drained kernel events into hash-chained WAL rows, continuing the
+// sha256 upgrade lands.// Mirror one recordNominationVote transition into kernel ops. Every write
+// is a BIND; the voter's cell LINKs to the nomination cell ('cast').
+export const projectNominationVote = (
+	kernel: KernelLike,
+	input: VoteProjectionInput
+): void => {
+	const base = `nomination.${input.nominationId}`
+	// the nomination itself is a cell — link endpoints must exist (L1 law)
+	kernel.bind(base, { id: input.nominationId, kind: "nomination" })
+	kernel.bind(`${base}.mutation`, input.mutationId, { ts: input.ts })
+	kernel.bind(`${base}.status`, input.status)
+	kernel.bind(`${base}.totals`, input.totals)
+	kernel.bind(`${base}.completedAt`, input.completedAt)
+	if (input.resultKind !== "expired") {
+		const voteCell = `${base}.vote.${input.reviewerId}`
+		kernel.bind(voteCell, input.choice, { ts: input.ts })
+		kernel.link(voteCell, base, "cast")
+	}
+}
+
+// Turn drained kernel events into hash-chained WAL rows, continuing the
 // chain from `tip` (0 for genesis) and `prevHash`.
 export const buildWalRows = (
 	events: Array<{ kind: string; cell: string | null; value: unknown }>,
