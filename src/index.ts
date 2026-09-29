@@ -19,6 +19,7 @@ import AutoPublishMessageCreate from "./events/autoPublishMessageCreate.js"
 import GifRepostMessageCreate from "./events/gifRepostMessageCreate.js"
 import GithubLinkSuppressMessageCreate from "./events/githubLinkSuppressMessageCreate.js"
 import GithubSummaryReactionAdd from "./events/githubSummaryReactionAdd.js"
+import { runQuiltReconcileTick } from "./quilt/reconcile.js"
 import Ready from "./events/ready.js"
 import ThreadCreateWelcome from "./events/threadCreateWelcome.js"
 import {
@@ -172,6 +173,7 @@ export default {
 		ctx.waitUntil(runNominationCardSyncRecovery(client))
 		if (!controller.cron || controller.cron === "0 */2 * * *") {
 			ctx.waitUntil(runThreadLengthMonitor(client))
+			ctx.waitUntil(runQuiltReconcileTick())
 		}
 	}
 } satisfies ExportedHandler<Env>

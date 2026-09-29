@@ -13,8 +13,16 @@ import {
 	verifyChain,
 	type WalRow
 } from "./projection.js"
-import type { NominationDatabase } from "../data/nominations.js"
-import type { LobsterDatabase } from "../data/lobsterEncounters.js"
+import { getPrimaryDb } from "../db.js"
+import {
+	getNominationReviewState,
+	type NominationDatabase
+} from "../data/nominations.js"
+import {
+	getLobsterEncounter,
+	type LobsterDatabase
+} from "../data/lobsterEncounters.js"
+import { reconcileTick, type ReconcileTickSummary } from "./ops.js"
 
 export type WalMismatch = {
 	entity: "nomination" | "encounter"
@@ -162,3 +170,39 @@ export const reconcileQuiltWal = async (
 		mismatches
 	}
 }
+
+// Cron entry: read the whole WAL, replay-verify it against live D1, and
+// hand reconcileTick the shape it summarizes. A broken chain is reported
+// (chain.ok=false, breakAt) rather than thrown; reconcileTick itself turns
+// any thrown D1 error into a counted `reconcile_tick` failure.
+export const runQuiltReconcileTick = (
+	database: NominationDatabase & LobsterDatabase = getPrimaryDb()
+): Promise<ReconcileTickSummary> =>
+	reconcileTick(async () => {
+		const result = await database.$client
+			.prepare(
+				`select seq, mutation_id, ts, cell, op, value, prev_hash, hash
+				 from quilt_wal order by seq asc`
+			)
+			.all<WalRow>()
+		const walRows = (result.results ?? []).map((row) => ({
+			...row,
+			seq: Number(row.seq)
+		}))
+		const reconciled = await reconcileQuiltWal(database, walRows, {
+			getNominationReviewState,
+			getLobsterEncounter
+		})
+		if (!reconciled.ok) {
+			return {
+				checked: { nominations: 0, encounters: 0 },
+				mismatches: [],
+				chain: { ok: false, breakAt: reconciled.firstBadSeq ?? undefined }
+			}
+		}
+		return {
+			checked: reconciled.checked,
+			mismatches: reconciled.mismatches,
+			chain: { ok: true }
+		}
+	})

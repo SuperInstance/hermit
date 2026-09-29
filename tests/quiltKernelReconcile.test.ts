@@ -17,7 +17,8 @@ import {
 	type CreateLobsterEncounterInput,
 	type LobsterDatabase
 } from "../src/data/lobsterEncounters.js"
-import { reconcileQuiltWal } from "../src/quilt/reconcile.js"
+import { reconcileQuiltWal, runQuiltReconcileTick } from "../src/quilt/reconcile.js"
+import { getWalRowsCommitted, resetWalOps } from "../src/quilt/ops.js"
 import { verifyChain, type WalRow } from "../src/quilt/projection.js"
 import { SqliteD1Database } from "./helpers/sqliteD1.js"
 
@@ -229,6 +230,29 @@ describe("quilt kernel — reconciliation", () => {
 			(m) => m.entity === "nomination" && m.field === "votes"
 		)
 		expect(voteMismatch).toBeDefined()
+		owner.close()
+	})
+
+	it("cron tick reconciles live WAL and reports gauge + drift", async () => {
+		resetWalOps()
+		const { owner, database } = createHarness()
+		const t0 = new Date("2026-09-17T00:00:00Z")
+		const nominationId = insertNomination(owner)
+		await recordNominationVote(nominationId, "ct-1", "approve", t0, database)
+		expect(getWalRowsCommitted()).toBeGreaterThan(0)
+
+		const clean = await runQuiltReconcileTick(database)
+		expect(clean.ok).toBe(true)
+		expect(clean.chainOk).toBe(true)
+		expect(clean.checked.nominations).toBe(1)
+		expect(clean.mismatchCount).toBe(0)
+		expect(clean.rowsCommitted).toBe(getWalRowsCommitted())
+
+		owner.database
+			.query(`update nominations set status = 'declined' where id = ?`)
+			.run(nominationId)
+		const drifted = await runQuiltReconcileTick(database)
+		expect(drifted.mismatchCount).toBeGreaterThan(0)
 		owner.close()
 	})
 })
