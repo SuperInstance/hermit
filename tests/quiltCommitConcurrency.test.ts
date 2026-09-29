@@ -136,7 +136,7 @@ describe("quilt WAL commit — tip race (Lane D repro)", () => {
 		expect(mutations.has("m-race-A")).toBe(true)
 		expect(mutations.has("m-race-B")).toBe(true)
 		// the chain verifies end to end
-		expect(verifyChain(rows)).toBe(true)
+		expect(verifyChain(rows).ok).toBe(true)
 		owner.close()
 	})
 
@@ -162,7 +162,7 @@ describe("quilt WAL commit — tip race (Lane D repro)", () => {
 		expect(rows.length).toBe(committed.reduce((sum, n) => sum + n, 0))
 		const prevs = rows.map((row) => row.prev_hash)
 		expect(new Set(prevs).size).toBe(prevs.length)
-		expect(verifyChain(rows)).toBe(true)
+		expect(verifyChain(rows).ok).toBe(true)
 		owner.close()
 	})
 
@@ -182,7 +182,7 @@ describe("quilt WAL commit — tip race (Lane D repro)", () => {
 		)
 		expect(first).toBeGreaterThan(0)
 		expect(second).toBeGreaterThan(0)
-		expect(verifyChain(walRows(owner))).toBe(true)
+		expect(verifyChain(walRows(owner)).ok).toBe(true)
 		owner.close()
 	})
 })

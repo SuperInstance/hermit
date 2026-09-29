@@ -38,11 +38,11 @@ describe("quilt WAL hash posture", () => {
 			[event("nomination.1.status", "granting"), event("nomination.1.completedAt", "2026-09-20")],
 			{ mutationId: "m-2", ts: "2026-09-20T07:05:00Z", tip: 0, prevHash: null }
 		)
-		expect(verifyChain(rows)).toBe(true)
+		expect(verifyChain(rows).ok).toBe(true)
 		const tampered: WalRow[] = rows.map((row, index) =>
 			index === 1 ? { ...row, value: '"forged"' } : row
 		)
-		expect(verifyChain(tampered)).toBe(false)
+		expect(verifyChain(tampered).ok).toBe(false)
 	})
 
 	it("genesis continuity: rows built on an existing tip chain onto its prev", () => {
@@ -58,7 +58,7 @@ describe("quilt WAL hash posture", () => {
 			tip: first[0].seq,
 			prevHash: first[0].hash
 		})
-		expect(verifyChain([...first, ...second])).toBe(true)
+		expect(verifyChain([...first, ...second]).ok).toBe(true)
 	})
 
 	it.todo(

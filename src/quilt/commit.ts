@@ -1,4 +1,5 @@
 // commit.ts — dual-write one vote transition into the quilt WAL.
+import { recordWalCommit, recordWalFailure } from "./ops.js"
 import { QuiltKernel, type QuiltEvent } from "./reference-kernel.mjs"
 import {
 	buildWalRows,
@@ -7,7 +8,7 @@ import {
 	type WalRow
 } from "./projection.js"
 
-type WalClient = {
+export type WalClient = {
 	batch<T = Record<string, unknown>>(
 		statements: unknown[]
 	): Promise<Array<{ results: T[] }>>
@@ -15,6 +16,8 @@ type WalClient = {
 		bind(...values: unknown[]): unknown
 	}
 }
+
+export type CommitContext = { mutationId: string; ts: string }
 
 export type ChainTip = { tip: number; prev: string | null }
 
@@ -54,35 +57,14 @@ const TIP_QUERY = `select coalesce(max(seq), 0) as tip,
 	(select hash from quilt_wal order by seq desc limit 1) as prev
  from quilt_wal`
 
-// Project a vote into kernel ops and append the hash-chained WAL rows.
-// Returns the number of rows committed. Throws QuiltChainConflictError if
-// another writer won the tip between our read and our insert; throws only
-// on D1 failure otherwise — callers in the vote path catch and log
-// (dual-write posture).
-export const commitNominationVoteProjection = async (
+// Guarded append: all rows in ONE batch, anchor row refuses an already
+// chained prev_hash, then the tip is re-verified. Shared by every
+// projector so no path can fork the chain. Records the commit gauge.
+const appendChainRows = async (
 	client: WalClient,
-	input: VoteProjectionInput
+	rows: WalRow[],
+	priorTip: number
 ): Promise<number> => {
-	const kernel = new QuiltKernel()
-	const events: QuiltEvent[] = []
-	const unsubscribe = kernel.subscribe((event) => {
-		events.push(event)
-	})
-	projectNominationVote(kernel, input)
-	unsubscribe()
-
-	const [tipResult] = await client.batch<ChainTip>([
-		client.prepare(TIP_QUERY)
-	])
-	const tipRow = tipResult?.results?.[0] ?? { tip: 0, prev: null }
-	const rows = buildWalRows(events, {
-		mutationId: input.mutationId,
-		ts: input.ts,
-		tip: Number(tipRow.tip ?? 0),
-		prevHash: tipRow.prev ?? null
-	})
-	if (rows.length === 0) return 0
-
 	await client.batch(
 		rows.map((row: WalRow, index: number) =>
 			client
@@ -128,7 +110,7 @@ export const commitNominationVoteProjection = async (
 		client.prepare(TIP_QUERY)
 	])
 	const afterRow = afterResult?.results?.[0]
-	const expectedTip = Number(tipRow.tip ?? 0) + rows.length
+	const expectedTip = priorTip + rows.length
 	const finalHash = rows[rows.length - 1].hash
 	if (
 		!afterRow ||
@@ -137,7 +119,95 @@ export const commitNominationVoteProjection = async (
 	) {
 		throw new QuiltChainConflictError(rows[0].prev_hash)
 	}
+	recordWalCommit(rows.length)
 	return rows.length
+}
+
+// Project a vote into kernel ops and append the hash-chained WAL rows.
+// Returns the number of rows committed. Throws QuiltChainConflictError if
+// another writer won the tip between our read and our insert; throws only
+// on D1 failure otherwise — callers in the vote path catch and log
+// (dual-write posture).
+export const commitNominationVoteProjection = async (
+	client: WalClient,
+	input: VoteProjectionInput
+): Promise<number> => {
+	const kernel = new QuiltKernel()
+	const events: QuiltEvent[] = []
+	const unsubscribe = kernel.subscribe((event) => {
+		events.push(event)
+	})
+	projectNominationVote(kernel, input)
+	unsubscribe()
+
+	const [tipResult] = await client.batch<ChainTip>([
+		client.prepare(TIP_QUERY)
+	])
+	const tipRow = tipResult?.results?.[0] ?? { tip: 0, prev: null }
+	const rows = buildWalRows(events, {
+		mutationId: input.mutationId,
+		ts: input.ts,
+		tip: Number(tipRow.tip ?? 0),
+		prevHash: tipRow.prev ?? null
+	})
+	if (rows.length === 0) return 0
+
+	return appendChainRows(client, rows, Number(tipRow.tip ?? 0))
+}
+
+const LOCK_TTL_MS = 30_000
+const LOCK_ATTEMPTS = 8
+const seed = Date.now().toString(36)
+let nonce = 0
+const nextHolder = (mutationId: string) =>
+	`${mutationId}:${seed}:${(nonce += 1)}`
+
+const sleep = (ms: number) =>
+	new Promise((resolve) => setTimeout(resolve, ms))
+
+const claimWalLock = async (
+	client: WalClient,
+	holder: string,
+	now: Date
+): Promise<boolean> => {
+	const nowIso = now.toISOString()
+	const staleBefore = new Date(now.getTime() - LOCK_TTL_MS).toISOString()
+	await client.batch([
+		client.prepare(
+			`insert or ignore into quilt_wal_lock (id, holder, acquired_at)
+			 values (1, '', '')`
+		)
+	])
+	for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt++) {
+		const [claimed] = await client.batch<{ id: number }>([
+			client
+				.prepare(
+					`update quilt_wal_lock
+					 set holder = ?, acquired_at = ?
+					 where id = 1 and (holder = '' or acquired_at < ?)
+					 returning id`
+				)
+				.bind(holder, nowIso, staleBefore)
+		])
+		if (claimed?.results?.[0]) return true
+		await sleep(Math.min(200, 5 * 2 ** attempt) + Math.floor(Math.random() * 10))
+	}
+	return false
+}
+
+const releaseWalLock = async (
+	client: WalClient,
+	holder: string
+): Promise<void> => {
+	await client.batch([
+		client
+			.prepare(
+				`update quilt_wal_lock
+				 set holder = '', acquired_at = ''
+				 where id = 1 and holder = ?`
+			)
+			.bind(holder)
+	])
 }
 
 // Generic projector: run `project` against a fresh kernel, drain the
@@ -150,58 +220,42 @@ export const commitProjection = async (
 	context: CommitContext,
 	project: (kernel: QuiltKernel) => void
 ): Promise<number> => {
-	const kernel = new QuiltKernel()
-	const events: QuiltEvent[] = []
-	const unsubscribe = kernel.subscribe((event) => {
-		events.push(event)
-	})
-	project(kernel)
-	unsubscribe()
+	const holder = nextHolder(context.mutationId)
+	const acquired = await claimWalLock(client, holder, new Date())
+	if (!acquired) {
+		recordWalFailure("lock_exhausted", context.mutationId)
+		return 0
+	}
+	try {
+		const kernel = new QuiltKernel()
+		const events: QuiltEvent[] = []
+		const unsubscribe = kernel.subscribe((event) => {
+			events.push(event)
+		})
+		project(kernel)
+		unsubscribe()
 
-	if (events.length === 0) return 0
+		if (events.length === 0) return 0
 
-	const [tipResult] = await client.batch<ChainTip>([
-		client.prepare(
-			`select coalesce(max(seq), 0) as tip,
-			 (select hash from quilt_wal order by seq desc limit 1) as prev
-			 from quilt_wal`
-		)
-	])
-	const tipRow = tipResult?.results?.[0] ?? { tip: 0, prev: null }
-	const rows = buildWalRows(events, {
-		mutationId: context.mutationId,
-		ts: context.ts,
-		tip: Number(tipRow.tip ?? 0),
-		prevHash: tipRow.prev ?? null
-	})
-	if (rows.length === 0) return 0
-
-	await client.batch(
-		rows.map((row: WalRow) =>
+		const [tipResult] = await client.batch<ChainTip>([
 			client.prepare(
-				`insert into quilt_wal
-				 (mutation_id, ts, cell, op, value, prev_hash, hash)
-				 values (?, ?, ?, ?, ?, ?, ?)
-				 ${rows.indexOf(row) === 0
-					? `where not exists (
-							select 1 from quilt_wal where prev_hash = ?
-						)`
-					: `where exists (
-							select 1 from quilt_wal where hash = ?
-						)`}`,
-				[
-					row.mutation_id,
-					row.ts,
-					row.cell,
-					row.op,
-					row.value,
-					rows.indexOf(row) === 0 ? row.prev_hash : row.prev_hash,
-					row.hash,
-					rows.indexOf(row) === 0 ? row.prev_hash : row.prev_hash
-				]
+				`select coalesce(max(seq), 0) as tip,
+				 (select hash from quilt_wal order by seq desc limit 1) as prev
+				 from quilt_wal`
 			)
-		)
-	)
-	return rows.length
+		])
+		const tipRow = tipResult?.results?.[0] ?? { tip: 0, prev: null }
+		const rows = buildWalRows(events, {
+			mutationId: context.mutationId,
+			ts: context.ts,
+			tip: Number(tipRow.tip ?? 0),
+			prevHash: tipRow.prev ?? null
+		})
+		if (rows.length === 0) return 0
+
+		return appendChainRows(client, rows, Number(tipRow.tip ?? 0))
+	} finally {
+		await releaseWalLock(client, holder)
+	}
 }
 

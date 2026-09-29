@@ -130,7 +130,7 @@ describe("quilt WAL CAS guard — Lane C bug #1", () => {
 		expect(loserError).toBeInstanceOf(QuiltChainConflictError)
 
 		const rows = walRows(writer)
-		expect(verifyChain(rows)).toBe(true)
+		expect(verifyChain(rows).ok).toBe(true)
 		// zero partial rows from the loser — no fork, no orphan tail
 		expect(rows.some((row) => row.mutation_id === "mutation-loser")).toBe(false)
 		expect(rows.filter((row) => row.mutation_id === "mutation-winner").length).toBe(
@@ -166,7 +166,7 @@ describe("quilt WAL CAS guard — Lane C bug #1", () => {
 
 		const rows = walRows(owner)
 		expect(rows.length).toBe(first + second)
-		expect(verifyChain(rows)).toBe(true)
+		expect(verifyChain(rows).ok).toBe(true)
 		expect(rows[0].prev_hash).toBe("GENESIS")
 		// each mutation chained its own anchor from the live tip
 		expect(rows[first].prev_hash).toBe(rows[first - 1].hash)

@@ -118,7 +118,7 @@ describe("quilt kernel — lobster encounter shadow", () => {
 		expect(cells.has(`${cell}.publication`)).toBe(true)
 		// the changes()=1 linkage, made traversable: attempt -> encounter
 		expect(cells.has(`encounter.ix-created->${cell}`)).toBe(true)
-		expect(verifyChain(rows)).toBe(true)
+		expect(verifyChain(rows).ok).toBe(true)
 
 		const replayed = replayEncounterFromWal(rows, result.encounter.id)
 		expect(replayed).not.toBeNull()
@@ -211,7 +211,7 @@ describe("quilt kernel — lobster encounter shadow", () => {
 			.prepare(`select count(*) as n from lobster_encounters`)
 			.all<{ n: number }>()
 		expect(Number(liveCount.results?.[0]?.n ?? 0)).toBe(1)
-		expect(verifyChain(rows)).toBe(true)
+		expect(verifyChain(rows).ok).toBe(true)
 	})
 
 	it("records an idempotent retry as a retried row", async () => {
@@ -228,7 +228,7 @@ describe("quilt kernel — lobster encounter shadow", () => {
 			(row) => row.cell === "encounter.ix-retry.retried"
 		)
 		expect(retried?.op).toBe("bind")
-		expect(verifyChain(rows)).toBe(true)
+		expect(verifyChain(rows).ok).toBe(true)
 	})
 
 	it("projects bind → response; replay shows the full lifecycle", async () => {
@@ -269,7 +269,7 @@ describe("quilt kernel — lobster encounter shadow", () => {
 		expect(replayed?.message).toBe("msg-1")
 		expect(replayed?.response?.type).toBe("offer_butter")
 		expect(replayed?.response?.responderId).toBe("target-1")
-		expect(verifyChain(rows)).toBe(true)
+		expect(verifyChain(rows).ok).toBe(true)
 	})
 
 	it("projects publication failure and the replay shows it", async () => {
@@ -290,7 +290,7 @@ describe("quilt kernel — lobster encounter shadow", () => {
 		const rows = await readWalRows(owner)
 		const replayed = replayEncounterFromWal(rows, created.encounter.id)
 		expect(replayed?.publication).toBe("publication_failed")
-		expect(verifyChain(rows)).toBe(true)
+		expect(verifyChain(rows).ok).toBe(true)
 	})
 
 	it("keeps the chain valid across mixed traffic", async () => {
@@ -320,6 +320,6 @@ describe("quilt kernel — lobster encounter shadow", () => {
 		expect(rows.length).toBeGreaterThan(8)
 		const seqs = rows.map((row) => row.seq)
 		expect(new Set(seqs).size).toBe(seqs.length)
-		expect(verifyChain(rows)).toBe(true)
+		expect(verifyChain(rows).ok).toBe(true)
 	})
 })
