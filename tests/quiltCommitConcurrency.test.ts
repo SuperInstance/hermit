@@ -9,12 +9,15 @@
 // on every run, not just when the scheduler feels like it.
 //
 // Expected posture: FAILS on unfixed main (fork: duplicate prev_hash,
-// verifyChain === false), PASSES once the prev_hash uniqueness guard +
-// optimistic retry lands (drizzle 0014).
+// verifyChain === false), PASSES with the CAS guard + prev_hash unique
+// index (drizzle 0014): one winner, losers throw, no fork.
 import { Database } from "bun:sqlite"
 import { describe, expect, it } from "bun:test"
 import { readdirSync, readFileSync } from "node:fs"
-import { commitNominationVoteProjection } from "../src/quilt/commit.js"
+import {
+	commitNominationVoteProjection,
+	QuiltChainConflictError
+} from "../src/quilt/commit.js"
 import {
 	verifyChain,
 	type VoteProjectionInput,
@@ -117,25 +120,26 @@ describe("quilt WAL commit — tip race (Lane D repro)", () => {
 
 		const inputA = voteInput("ct-1", "m-race-A")
 		const inputB = voteInput("ct-2", "m-race-B")
-		const [rowsA, rowsB] = await Promise.all([
+		const settled = await Promise.allSettled([
 			commitNominationVoteProjection(clientA, inputA),
 			commitNominationVoteProjection(clientB, inputB)
 		])
-		// both projections land — the guard must not turn the race into a
-		// lost vote (dual-write posture: mirror gaps are logged, not thrown)
-		expect(rowsA).toBeGreaterThan(0)
-		expect(rowsB).toBeGreaterThan(0)
+		// shipped contract (tests/quiltWalCas.test.ts, commit.ts CAS guard):
+		// exactly one writer extends the tip; the loser throws
+		// QuiltChainConflictError and appends nothing. The caller
+		// (data/nominations.ts) counts the loss; the vote itself is unaffected.
+		const won = settled.filter((r) => r.status === "fulfilled")
+		const lost = settled.filter((r) => r.status === "rejected")
+		expect(won).toHaveLength(1)
+		expect(lost).toHaveLength(1)
+		expect((lost[0] as PromiseRejectedResult).reason).toBeInstanceOf(
+			QuiltChainConflictError
+		)
 
 		const rows = walRows(owner)
-		expect(rows.length).toBe(rowsA + rowsB)
-		// a fork is exactly two rows claiming the same parent
 		const prevs = rows.map((row) => row.prev_hash)
 		expect(new Set(prevs).size).toBe(prevs.length)
-		// both mutations are present in the surviving chain
-		const mutations = new Set(rows.map((row) => row.mutation_id))
-		expect(mutations.has("m-race-A")).toBe(true)
-		expect(mutations.has("m-race-B")).toBe(true)
-		// the chain verifies end to end
+		expect(new Set(rows.map((row) => row.mutation_id)).size).toBe(1)
 		expect(verifyChain(rows).ok).toBe(true)
 		owner.close()
 	})
@@ -151,17 +155,23 @@ describe("quilt WAL commit — tip race (Lane D repro)", () => {
 			() => new InterleavingWalClient(owner, arrive)
 		)
 
-		const committed = await Promise.all(
+		const settled = await Promise.allSettled(
 			inputs.map((input, index) =>
 				commitNominationVoteProjection(clients[index], input)
 			)
 		)
-		for (const count of committed) expect(count).toBeGreaterThan(0)
+		const won = settled.filter((r) => r.status === "fulfilled")
+		expect(won).toHaveLength(1)
+		for (const r of settled) {
+			if (r.status === "rejected") {
+				expect(r.reason).toBeInstanceOf(QuiltChainConflictError)
+			}
+		}
 
 		const rows = walRows(owner)
-		expect(rows.length).toBe(committed.reduce((sum, n) => sum + n, 0))
 		const prevs = rows.map((row) => row.prev_hash)
 		expect(new Set(prevs).size).toBe(prevs.length)
+		expect(new Set(rows.map((row) => row.mutation_id)).size).toBe(1)
 		expect(verifyChain(rows).ok).toBe(true)
 		owner.close()
 	})
